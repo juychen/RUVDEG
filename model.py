@@ -8,16 +8,20 @@ import pandas as pd
 class RUVVAE_DEG(nn.Module):
     """RUV-VAE 主方法做 DEG：group 是显式生物学效应，batch 是 UV 协变量"""
     
-    def __init__(self, n_genes, n_group=2, n_batch=0, d_bio=32, k_unk=5):
+    def __init__(self, n_genes, n_group=2, n_batch=0, n_genes_on=0,
+                 d_bio=32, k_unk=5):
         super().__init__()
         self.n_genes = n_genes
-        
+
         # group 是研究目标的生物学设计变量，不属于 unwanted variation。
-        # 只有 batch 等已知技术因素放入 W_cov，并在重建时扣除。
+        # 只有 batch、n_genes_on 等已知技术因素放入 W_cov，并在重建时扣除。
         self.W_group = nn.Parameter(torch.randn(n_group, n_genes) * 0.01)
         cov_blocks = {}
         if n_batch > 0:
             cov_blocks["batch"] = n_batch
+        if n_genes_on > 0:
+            cov_blocks["n_genes_on"] = n_genes_on
+        self.cov_dims = cov_blocks.copy()
         
         # 编码器
         self.encoder_z = nn.Sequential(
@@ -49,6 +53,10 @@ class RUVVAE_DEG(nn.Module):
         return mu + std * torch.randn_like(std)
     
     def compute_delta_cov(self, c_dict):
+        missing = [name for name in self.W_cov if name not in c_dict]
+        if missing:
+            raise KeyError(f"Missing nuisance covariates in c_dict: {missing}")
+
         delta = 0
         for name, W in self.W_cov.items():
             delta = delta + c_dict[name] @ W
@@ -89,7 +97,7 @@ class RUVVAE_DEG(nn.Module):
     
 @torch.no_grad()
 def compute_deg(model, Y, gene_names, group_labels, groups_unique,
-                neg_control_mask, batch_labels=None,
+                neg_control_mask, batch_labels=None, n_genes_on=None,
                 n_posterior=200,
                 n_perm=500):
     """用 RUV-VAE 计算 DEG，返回 logFC + 多个 GLM 风格 p-value。
@@ -109,6 +117,7 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
         groups_unique:组名列表（[0] 为对照，[1] 为处理）
         neg_control_mask: (n_genes,) bool mask
         batch_labels: 可选，每个样本的批次名
+        n_genes_on: 可选，标准化后的每个样本检测到的基因数（n_samples, 或 n_samples×1）
         n_posterior:   后验采样数
         n_perm:        置换检验次数
     """
@@ -122,7 +131,17 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
         batches = sorted(np.unique(batch_labels))
         batch_idx = np.array([batches.index(b) for b in batch_labels])
         c_dict["batch"] = torch.FloatTensor(np.eye(len(batches))[batch_idx])
-    
+    if n_genes_on is not None:
+        detection = np.asarray(n_genes_on, dtype=np.float32)
+        if detection.ndim == 1:
+            detection = detection[:, None]
+        if detection.shape != (n_samples, 1):
+            raise ValueError(
+                f"n_genes_on must have shape ({n_samples},) or ({n_samples}, 1), "
+                f"got {detection.shape}"
+            )
+        c_dict["n_genes_on"] = torch.from_numpy(detection)
+
     Y_t = torch.FloatTensor(Y); nc_t = torch.BoolTensor(neg_control_mask)
     out = model(Y_t, c_dict, nc_t)
     
@@ -136,10 +155,17 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
     delta_lat = out['delta_lat'].numpy()
     logFC_uv_latent = delta_lat[mask_disease].mean(0) - delta_lat[mask_ctrl].mean(0)
     
-    delta_cov = out['delta_cov'].numpy()
+    delta_cov = out['delta_cov'].cpu().numpy()
     logFC_uv_cov = delta_cov[mask_disease].mean(0) - delta_cov[mask_ctrl].mean(0)
     logFC_uv_total = logFC_uv_latent + logFC_uv_cov
-    
+
+    logFC_uv_n_genes_on = np.zeros(n_genes)
+    if n_genes_on is not None and "n_genes_on" in model.W_cov:
+        detection = np.asarray(n_genes_on, dtype=np.float32).reshape(-1, 1)
+        detection_diff = detection[mask_disease].mean(0) - detection[mask_ctrl].mean(0)
+        detection_W = model.W_cov["n_genes_on"].detach().cpu().numpy()
+        logFC_uv_n_genes_on = detection_diff @ detection_W
+
     # ============= 生物学贡献 =============
     # group 是目标生物学差异，不能作为 UV 从 y_bio 中扣除。
     W_group = model.W_group.detach().cpu().numpy()
@@ -269,6 +295,7 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
         # UV 贡献；group 已经单独作为生物学效应返回
         'logFC_uv_group': np.zeros(n_genes),
         'logFC_uv_linear': logFC_uv_cov,
+        'logFC_uv_n_genes_on': logFC_uv_n_genes_on,
         'logFC_uv_latent': logFC_uv_latent,
         'logFC_uv_cov': logFC_uv_cov,
         'logFC_uv_total': logFC_uv_total,
