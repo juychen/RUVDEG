@@ -5,13 +5,100 @@ import numpy as np
 import pandas as pd
 
 
+class ZINBLoss:
+    """Zero-Inflated Negative Binomial loss, similar to scVI.
+
+    Models scRNA-seq counts as a mixture of:
+      - A point mass at zero (dropout, with probability pi)
+      - A Negative Binomial (with mean mu and inverse-dispersion theta)
+
+    Usage:
+        zinb = ZINBLoss()
+        nll = zinb.log_zinb(x, mu, theta, pi)  # -> negative log-likelihood per gene
+    """
+
+    @staticmethod
+    def _xlogy(x, y):
+        """x * log(y), returns 0 when x == 0 (avoids 0 * -inf = NaN)."""
+        return torch.where(x == 0, torch.zeros_like(x), x * torch.log(y))
+
+    @staticmethod
+    def log_nb(x, mu, theta, eps=1e-6):
+        """Log-probability of the Negative Binomial distribution.
+
+        NB(x | mu, theta) = Gamma(x + theta) / (Gamma(theta) * Gamma(x + 1))
+                            * (theta / (theta + mu))^theta
+                            * (mu / (theta + mu))^x
+
+        Args:
+            x:     observed counts  (N, G)
+            mu:    NB mean           (N, G)
+            theta: inverse-dispersion (G,) or (N, G)
+            eps:   numerical stability
+        """
+        if theta.dim() == 1:
+            theta = theta.unsqueeze(0)  # (1, G) -> broadcasts over N
+        softplus_mu = F.softplus(mu) + eps
+        softplus_theta = F.softplus(theta) + eps
+
+        # Use _xlogy for x * log(ratio) to avoid 0 * (-inf) = NaN
+        return (torch.lgamma(x + softplus_theta)
+                - torch.lgamma(softplus_theta)
+                - torch.lgamma(x + 1)
+                + ZINBLoss._xlogy(softplus_theta,
+                                  softplus_theta / (softplus_theta + softplus_mu))
+                + ZINBLoss._xlogy(x,
+                                  softplus_mu / (softplus_theta + softplus_mu)))
+
+    @staticmethod
+    def log_zinb(x, mu, theta, pi, eps=1e-6):
+        """Log-probability of the Zero-Inflated Negative Binomial.
+
+        ZINB(x | mu, theta, pi) = pi * I(x == 0) + (1 - pi) * NB(x | mu, theta)
+
+        Uses torch.where to separate zero / non-zero cases — avoids
+        0 * inf = NaN that arises from mask * exp(large_value).
+
+        Args:
+            x:     observed counts  (N, G)
+            mu:    NB mean           (N, G)
+            theta: inverse-dispersion (G,) or (N, G)
+            pi:    dropout probability (N, G), in (0, 1)
+            eps:   numerical stability
+        """
+        pi = torch.clamp(pi, eps, 1.0 - eps)
+        nb_ll = ZINBLoss.log_nb(x, mu, theta, eps)
+
+        # At x == 0: ZINB prob = pi + (1-pi) * exp(nb_ll)
+        # At x != 0: ZINB prob = (1-pi) * exp(nb_ll)  --- in log: log(1-pi) + nb_ll
+        # nb_ll is log P(NB), always ≤ 0, so exp(nb_ll) ∈ (0,1] — no overflow
+        log_prob = torch.where(
+            x == 0,
+            torch.log(pi + (1.0 - pi) * torch.exp(nb_ll) + eps),
+            torch.log(1.0 - pi) + nb_ll,
+        )
+        return log_prob
+
+    @staticmethod
+    def nll(x, mu, theta, pi, eps=1e-6):
+        """Negative log-likelihood (scalar mean over all entries)."""
+        ll = ZINBLoss.log_zinb(x, mu, theta, pi, eps)
+        return -ll.mean()
+
+
 class RUVVAE_DEG(nn.Module):
-    """RUV-VAE 主方法做 DEG：group 是显式生物学效应，batch 是 UV 协变量"""
-    
+    """RUV-VAE 主方法做 DEG：group 是显式生物学效应，batch 是 UV 协变量
+
+    Supports two reconstruction losses:
+      - MSE  (default,  use_zinb=False): mean squared error on log-scale
+      - ZINB (scVI-like, use_zinb=True):  Zero-Inflated Negative Binomial NLL
+    """
+
     def __init__(self, n_genes, n_group=2, n_batch=0, n_genes_on=0,
-                 d_bio=32, k_unk=5):
+                 d_bio=32, k_unk=5, use_zinb=False):
         super().__init__()
         self.n_genes = n_genes
+        self.use_zinb = use_zinb
 
         # group 是研究目标的生物学设计变量，不属于 unwanted variation。
         # 只有 batch、n_genes_on 等已知技术因素放入 W_cov，并在重建时扣除。
@@ -22,20 +109,20 @@ class RUVVAE_DEG(nn.Module):
         if n_genes_on > 0:
             cov_blocks["n_genes_on"] = n_genes_on
         self.cov_dims = cov_blocks.copy()
-        
+
         # 编码器
         self.encoder_z = nn.Sequential(
             nn.Linear(n_genes, 512), nn.LayerNorm(512), nn.GELU(),
             nn.Linear(512, 256), nn.LayerNorm(256), nn.GELU(),
         )
         self.z_mu = nn.Linear(256, d_bio); self.z_logvar = nn.Linear(256, d_bio)
-        
+
         self.encoder_w = nn.Sequential(
             nn.Linear(n_genes, 512), nn.LayerNorm(512), nn.GELU(),
             nn.Linear(512, 256), nn.LayerNorm(256), nn.GELU(),
         )
         self.w_mu = nn.Linear(256, k_unk); self.w_logvar = nn.Linear(256, k_unk)
-        
+
         # 解码器
         self.decoder_bio = nn.Sequential(nn.Linear(d_bio, 256), nn.GELU(),
                                          nn.Linear(256, n_genes))
@@ -47,6 +134,19 @@ class RUVVAE_DEG(nn.Module):
             for name, dim in cov_blocks.items()
         })
         self.bias = nn.Parameter(torch.zeros(n_genes))
+
+        # ---- ZINB 相关参数 (类似 scVI) ----
+        if use_zinb:
+            # 基因特异性逆离散度 (inverse-dispersion / r), 类似 scVI 的 px_r
+            self.px_r = nn.Parameter(torch.ones(n_genes))
+            # 零膨胀 (dropout) 解码器: 从生物隐变量 z 预测每个基因的 dropout 概率
+            self.decoder_dropout = nn.Sequential(
+                nn.Linear(d_bio, 256), nn.GELU(),
+                nn.Linear(256, n_genes),
+                nn.Sigmoid()  # pi ∈ (0, 1)
+            )
+            # NOTE: ZINB 均值复用 RUV 分解: mu = softplus(y_bio - delta_lat - delta_cov)
+            # decoder_bio, decoder_w, W_group, W_cov 全部参与 ZINB 重建，不另设 decoder_mu
     
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -66,34 +166,68 @@ class RUVVAE_DEG(nn.Module):
         h_z = self.encoder_z(y)
         z_mu, z_logvar = self.z_mu(h_z), self.z_logvar(h_z)
         z = self.reparameterize(z_mu, z_logvar)
-        
+
         h_w = self.encoder_w(y)
         w_mu, w_logvar = self.w_mu(h_w), self.w_logvar(h_w)
         w = self.reparameterize(w_mu, w_logvar)
-        
+
         y_bio_base = self.decoder_bio(z) + self.bias
         group_effect = c_dict["group"] @ self.W_group
         y_bio = y_bio_base + group_effect
         delta_lat = self.decoder_w(w)
         delta_cov = self.compute_delta_cov(c_dict)
-        y_recon = y_bio - delta_lat - delta_cov
-        
-        losses = {
-            'recon': F.mse_loss(y_recon, y),
-            'kl_z': -0.5 * torch.mean(1 + z_logvar - z_mu.pow(2) - z_logvar.exp()),
-            'kl_w': -0.5 * torch.mean(1 + w_logvar - w_mu.pow(2) - w_logvar.exp()),
-        }
+
+        if self.use_zinb:
+            # ---- ZINB 模式: 复用 RUV 分解 ----
+            # ZINB 均值基于 RUV 分解: mu = softplus(y_bio - delta_lat - delta_cov)
+            # 这样 decoder_bio, decoder_w, W_group, W_cov 全部被 ZINB loss 训练
+            y_mu = F.softplus(y_bio - delta_lat - delta_cov) + 1e-6  # (N, G), >0
+
+            # 零膨胀概率: 从 z 预测 (生物学隐变量驱动 dropout)
+            pi = self.decoder_dropout(z)  # (N, G), ∈ (0,1)
+            theta = self.px_r             # (G,), 基因特异性逆离散度
+
+            losses = {
+                'recon': ZINBLoss.nll(y, y_mu, theta, pi),
+                'kl_z': -0.5 * torch.mean(1 + z_logvar - z_mu.pow(2)
+                                         - z_logvar.exp()),
+                'kl_w': -0.5 * torch.mean(1 + w_logvar - w_mu.pow(2)
+                                         - w_logvar.exp()),
+            }
+            # y_recon = NB mean adjusted for dropout (expected ZINB count)
+            y_recon = y_mu * (1.0 - pi)
+            dropout = pi
+        else:
+            # ---- MSE 模式 (原始) ----
+            y_recon = y_bio - delta_lat - delta_cov
+            losses = {
+                'recon': F.mse_loss(y_recon, y),
+                'kl_z': -0.5 * torch.mean(1 + z_logvar - z_mu.pow(2)
+                                         - z_logvar.exp()),
+                'kl_w': -0.5 * torch.mean(1 + w_logvar - w_mu.pow(2)
+                                         - w_logvar.exp()),
+            }
+            dropout = None
+
         if neg_control_mask is not None:
             delta_total = delta_lat + delta_cov
             losses['nc_total'] = F.mse_loss(
                 delta_total[:, neg_control_mask],
                 y[:, neg_control_mask]
             )
-        return {'y_recon': y_recon, 'y_bio': y_bio,
-                'y_bio_base': y_bio_base, 'group_effect': group_effect,
-                'delta_lat': delta_lat, 'delta_cov': delta_cov,
-                'z_mu': z_mu, 'z_logvar': z_logvar,
-                'w_mu': w_mu, 'w_logvar': w_logvar, 'losses': losses}
+
+        result = {'y_recon': y_recon, 'y_bio': y_bio,
+                  'y_bio_base': y_bio_base, 'group_effect': group_effect,
+                  'delta_lat': delta_lat, 'delta_cov': delta_cov,
+                  'z_mu': z_mu, 'z_logvar': z_logvar,
+                  'w_mu': w_mu, 'w_logvar': w_logvar, 'losses': losses}
+
+        if self.use_zinb:
+            result['y_mu'] = y_mu
+            result['pi'] = dropout
+            result['theta'] = theta.expand(y.shape[0], -1)
+
+        return result
     
 @torch.no_grad()
 def compute_deg_all_methods_legacy(model, Y, gene_names, group_labels, groups_unique,
