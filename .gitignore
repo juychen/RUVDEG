@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter / Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+*~
+
+# Local model checkpoints / artifacts
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# VAE outputs / plots saved by notebook cells
+*.png
+!docs/**/*.png
+top*.png
+hkg*.png
+recon_*.png
+*.pdf
+
+# Scanpy / AnnData cache
+data_cache/
+adata_cache/
+
+# Local config
+.env
+.env.local
+*.local.yml
