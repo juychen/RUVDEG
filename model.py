@@ -96,10 +96,10 @@ class RUVVAE_DEG(nn.Module):
                 'w_mu': w_mu, 'w_logvar': w_logvar, 'losses': losses}
     
 @torch.no_grad()
-def compute_deg(model, Y, gene_names, group_labels, groups_unique,
-                neg_control_mask, batch_labels=None, n_genes_on=None,
-                n_posterior=200,
-                n_perm=500):
+def compute_deg_all_methods_legacy(model, Y, gene_names, group_labels, groups_unique,
+                                   neg_control_mask, batch_labels=None, n_genes_on=None,
+                                   n_posterior=200,
+                                   n_perm=500):
     """用 RUV-VAE 计算 DEG，返回 logFC + 多个 GLM 风格 p-value。
 
     p-value 方法（参考经典 GLM / MAST / DESeq2 / edgeR）：
@@ -314,3 +314,214 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
          'posterior_samples': logFC_posterior,
          'uv_posterior_samples': logFC_uv_posterior,
          'se_empirical': se_empirical, 't_stat': t_stat}
+
+
+@torch.no_grad()
+def compute_deg(model, Y, gene_names, group_labels, groups_unique,
+                neg_control_mask, batch_labels=None, n_genes_on=None,
+                method="wald", n_posterior=200, n_perm=500):
+    """Compute DEG with one selected inference method.
+
+    ``wald`` is the default and the closest option here to DESeq2's Wald-test
+    idea, but it is not a negative-binomial GLM and is not DESeq2 itself.
+    Other options are ``welch``, ``permutation``, ``bayes``, and ``all``.
+    """
+    from scipy import stats as _stats
+
+    allowed_methods = {"wald", "welch", "permutation", "bayes", "all"}
+    if method not in allowed_methods:
+        raise ValueError(
+            f"Unknown DEG method {method!r}; choose one of {sorted(allowed_methods)}"
+        )
+
+    if method == "all":
+        result, extra = compute_deg_all_methods_legacy(
+            model, Y, gene_names, group_labels, groups_unique,
+            neg_control_mask, batch_labels=batch_labels,
+            n_genes_on=n_genes_on, n_posterior=n_posterior, n_perm=n_perm,
+        )
+        result = result.copy()
+        result["p_value"] = result["p_value_glm_delta"]
+        result["test_stat"] = result["t_stat"]
+        result["se"] = result["se_glm"]
+        result["deg_method"] = "all"
+        return result, extra
+
+    model.eval()
+    Y = np.asarray(Y, dtype=np.float32)
+    group_labels = np.asarray(group_labels)
+    n_samples, n_genes = Y.shape
+
+    group_idx = np.array([groups_unique.index(g) for g in group_labels])
+    c_dict = {
+        "group": torch.FloatTensor(np.eye(len(groups_unique))[group_idx])
+    }
+    if batch_labels is not None:
+        batch_labels = np.asarray(batch_labels)
+        batches = sorted(np.unique(batch_labels))
+        batch_idx = np.array([batches.index(b) for b in batch_labels])
+        c_dict["batch"] = torch.FloatTensor(np.eye(len(batches))[batch_idx])
+
+    detection = None
+    if n_genes_on is not None:
+        detection = np.asarray(n_genes_on, dtype=np.float32)
+        if detection.ndim == 1:
+            detection = detection[:, None]
+        if detection.shape != (n_samples, 1):
+            raise ValueError(
+                f"n_genes_on must have shape ({n_samples},) or ({n_samples}, 1), "
+                f"got {detection.shape}"
+            )
+        c_dict["n_genes_on"] = torch.from_numpy(detection)
+
+    Y_t = torch.from_numpy(Y)
+    nc_t = torch.BoolTensor(neg_control_mask)
+    out = model(Y_t, c_dict, nc_t)
+
+    mask_ctrl = group_labels == groups_unique[0]
+    mask_disease = group_labels == groups_unique[1]
+    n_ctrl = int(mask_ctrl.sum())
+    n_disease = int(mask_disease.sum())
+    if n_ctrl < 2 or n_disease < 2:
+        raise ValueError("Each group needs at least two samples for DEG inference")
+
+    delta_lat = out["delta_lat"].cpu().numpy()
+    delta_cov = out["delta_cov"].cpu().numpy()
+    logFC_uv_latent = (
+        delta_lat[mask_disease].mean(0) - delta_lat[mask_ctrl].mean(0)
+    )
+    logFC_uv_cov = (
+        delta_cov[mask_disease].mean(0) - delta_cov[mask_ctrl].mean(0)
+    )
+    logFC_uv_total = logFC_uv_latent + logFC_uv_cov
+
+    logFC_uv_n_genes_on = np.zeros(n_genes)
+    if detection is not None and "n_genes_on" in model.W_cov:
+        detection_diff = (
+            detection[mask_disease].mean(0) - detection[mask_ctrl].mean(0)
+        )
+        detection_W = model.W_cov["n_genes_on"].detach().cpu().numpy()
+        logFC_uv_n_genes_on = detection_diff @ detection_W
+
+    W_group = model.W_group.detach().cpu().numpy()
+    logFC_group = W_group[1] - W_group[0]
+    y_bio_base = out["y_bio_base"].cpu().numpy()
+    logFC_bio_latent = (
+        y_bio_base[mask_disease].mean(0) - y_bio_base[mask_ctrl].mean(0)
+    )
+    y_bio = out["y_bio"].cpu().numpy()
+    logFC_bio = logFC_group + logFC_bio_latent
+
+    y_bio_dis = y_bio[mask_disease]
+    y_bio_ctr = y_bio[mask_ctrl]
+    mean_dis = y_bio_dis.mean(0)
+    mean_ctr = y_bio_ctr.mean(0)
+    obs_diff = mean_dis - mean_ctr
+    var_dis = y_bio_dis.var(0, ddof=1)
+    var_ctr = y_bio_ctr.var(0, ddof=1)
+    se = np.sqrt(var_dis / n_disease + var_ctr / n_ctrl) + 1e-8
+
+    data = {
+        "gene": gene_names,
+        "logFC_group": logFC_group,
+        "logFC_bio_latent": logFC_bio_latent,
+        "logFC_bio": logFC_bio,
+        "logFC_uv_group": np.zeros(n_genes),
+        "logFC_uv_linear": logFC_uv_cov,
+        "logFC_uv_n_genes_on": logFC_uv_n_genes_on,
+        "logFC_uv_latent": logFC_uv_latent,
+        "logFC_uv_cov": logFC_uv_cov,
+        "logFC_uv_total": logFC_uv_total,
+    }
+    extra = {
+        "W_group": W_group,
+        "y_bio": y_bio,
+        "w_mu": out["w_mu"].cpu().numpy(),
+        "z_mu": out["z_mu"].cpu().numpy(),
+        "delta_lat": delta_lat,
+        "delta_cov": delta_cov,
+    }
+
+    if method == "wald":
+        test_stat = obs_diff / se
+        p_value = 2.0 * _stats.norm.sf(np.abs(test_stat))
+        data["p_value_glm_delta"] = np.clip(p_value, 1e-300, 1.0)
+        data["se_glm"] = se
+
+    elif method == "welch":
+        test_stat = obs_diff / se
+        df_num = (var_dis / n_disease + var_ctr / n_ctrl) ** 2
+        df_den = (
+            (var_dis / n_disease) ** 2 / max(n_disease - 1, 1)
+            + (var_ctr / n_ctrl) ** 2 / max(n_ctrl - 1, 1)
+        )
+        df_welch = df_num / (df_den + 1e-12)
+        p_value = 2.0 * _stats.t.sf(np.abs(test_stat), df_welch)
+        data["p_value_empirical_t"] = np.clip(p_value, 1e-300, 1.0)
+        data["t_stat"] = test_stat
+        extra["df_welch"] = df_welch
+
+    elif method == "permutation":
+        if n_perm <= 0:
+            raise ValueError("n_perm must be positive for method='permutation'")
+        test_stat = obs_diff
+        y_bio_all = np.concatenate([y_bio_dis, y_bio_ctr], axis=0)
+        rng = np.random.default_rng(42)
+        count_ge = np.zeros(n_genes, dtype=np.int64)
+        for _ in range(n_perm):
+            idx = rng.permutation(y_bio_all.shape[0])
+            perm_diff = (
+                y_bio_all[idx[:n_disease]].mean(0)
+                - y_bio_all[idx[n_disease:n_disease + n_ctrl]].mean(0)
+            )
+            count_ge += np.abs(perm_diff) >= np.abs(obs_diff)
+        p_value = (count_ge + 1) / (n_perm + 1)
+        data["p_value_perm"] = np.clip(p_value, 1e-300, 1.0)
+
+    else:  # bayes
+        if n_posterior <= 0:
+            raise ValueError("n_posterior must be positive for method='bayes'")
+        z_mu = out["z_mu"]
+        z_logvar = out["z_logvar"]
+        w_mu = out["w_mu"]
+        w_logvar = out["w_logvar"]
+        posterior = np.zeros((n_posterior, n_genes))
+        for sample_idx in range(n_posterior):
+            z_sample = z_mu + torch.exp(0.5 * z_logvar) * torch.randn_like(z_mu)
+            w_sample = w_mu + torch.exp(0.5 * w_logvar) * torch.randn_like(w_mu)
+            y_bio_sample = (
+                model.decoder_bio(z_sample) + model.bias
+            ).cpu().numpy()
+            delta_lat_sample = model.decoder_w(w_sample).cpu().numpy()
+            bio_fc_sample = (
+                y_bio_sample[mask_disease].mean(0)
+                - y_bio_sample[mask_ctrl].mean(0)
+                + logFC_group
+            )
+            uv_fc_sample = (
+                delta_lat_sample[mask_disease].mean(0)
+                - delta_lat_sample[mask_ctrl].mean(0)
+            )
+            posterior[sample_idx] = (
+                bio_fc_sample - uv_fc_sample - logFC_uv_cov
+            )
+        positive_probability = (posterior > 0).mean(0)
+        p_value = 2.0 * np.minimum(
+            positive_probability, 1.0 - positive_probability
+        )
+        se = posterior.std(0) + 1e-8
+        test_stat = posterior.mean(0) / se
+        data["p_value_bayes"] = np.clip(p_value, 1e-300, 1.0)
+        data["logFC_bio_posterior_mean"] = posterior.mean(0)
+        data["logFC_bio_posterior_std"] = posterior.std(0)
+        data["logFC_bio_ci_low"] = np.percentile(posterior, 2.5, axis=0)
+        data["logFC_bio_ci_high"] = np.percentile(posterior, 97.5, axis=0)
+        extra["posterior_samples"] = posterior
+
+    data["p_value"] = np.clip(p_value, 1e-300, 1.0)
+    data["test_stat"] = test_stat
+    data["se"] = se
+    data["deg_method"] = method
+    extra["se"] = se
+    extra["test_stat"] = test_stat
+    return pd.DataFrame(data), extra
