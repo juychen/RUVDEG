@@ -6,13 +6,16 @@ import pandas as pd
 
 
 class RUVVAE_DEG(nn.Module):
-    """RUV-VAE 主方法做 DEG：group 作为显式协变量"""
+    """RUV-VAE 主方法做 DEG：group 是显式生物学效应，batch 是 UV 协变量"""
     
     def __init__(self, n_genes, n_group=2, n_batch=0, d_bio=32, k_unk=5):
         super().__init__()
         self.n_genes = n_genes
         
-        cov_blocks = {"group": n_group}
+        # group 是研究目标的生物学设计变量，不属于 unwanted variation。
+        # 只有 batch 等已知技术因素放入 W_cov，并在重建时扣除。
+        self.W_group = nn.Parameter(torch.randn(n_group, n_genes) * 0.01)
+        cov_blocks = {}
         if n_batch > 0:
             cov_blocks["batch"] = n_batch
         
@@ -60,7 +63,9 @@ class RUVVAE_DEG(nn.Module):
         w_mu, w_logvar = self.w_mu(h_w), self.w_logvar(h_w)
         w = self.reparameterize(w_mu, w_logvar)
         
-        y_bio = self.decoder_bio(z) + self.bias
+        y_bio_base = self.decoder_bio(z) + self.bias
+        group_effect = c_dict["group"] @ self.W_group
+        y_bio = y_bio_base + group_effect
         delta_lat = self.decoder_w(w)
         delta_cov = self.compute_delta_cov(c_dict)
         y_recon = y_bio - delta_lat - delta_cov
@@ -77,6 +82,7 @@ class RUVVAE_DEG(nn.Module):
                 y[:, neg_control_mask]
             )
         return {'y_recon': y_recon, 'y_bio': y_bio,
+                'y_bio_base': y_bio_base, 'group_effect': group_effect,
                 'delta_lat': delta_lat, 'delta_cov': delta_cov,
                 'z_mu': z_mu, 'z_logvar': z_logvar,
                 'w_mu': w_mu, 'w_logvar': w_logvar, 'losses': losses}
@@ -135,11 +141,16 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
     logFC_uv_total = logFC_uv_latent + logFC_uv_cov
     
     # ============= 生物学贡献 =============
-    W_group = model.W_cov["group"].detach().numpy()
-    logFC_linear = W_group[1] - W_group[0]
-    
-    y_bio = out['y_bio'].numpy()
-    logFC_bio = y_bio[mask_disease].mean(0) - y_bio[mask_ctrl].mean(0)
+    # group 是目标生物学差异，不能作为 UV 从 y_bio 中扣除。
+    W_group = model.W_group.detach().cpu().numpy()
+    logFC_group = W_group[1] - W_group[0]
+
+    y_bio_base = out['y_bio_base'].cpu().numpy()
+    logFC_bio_latent = (
+        y_bio_base[mask_disease].mean(0) - y_bio_base[mask_ctrl].mean(0)
+    )
+    y_bio = out['y_bio'].cpu().numpy()
+    logFC_bio = logFC_bio_latent + logFC_group
     
     # ============= 后验贝叶斯 =============
     z_mu = out['z_mu']; z_logvar = out['z_logvar']
@@ -150,9 +161,11 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
     for s in range(n_posterior):
         z_sample = z_mu + torch.exp(0.5 * z_logvar) * torch.randn_like(z_mu)
         w_sample = w_mu + torch.exp(0.5 * w_logvar) * torch.randn_like(w_mu)
-        y_bio_s = (model.decoder_bio(z_sample) + model.bias).numpy()
-        delta_lat_s = model.decoder_w(w_sample).numpy()
-        bio_fc_s = y_bio_s[mask_disease].mean(0) - y_bio_s[mask_ctrl].mean(0)
+        y_bio_s = (model.decoder_bio(z_sample) + model.bias).cpu().numpy()
+        delta_lat_s = model.decoder_w(w_sample).cpu().numpy()
+        bio_fc_s = (
+            y_bio_s[mask_disease].mean(0) - y_bio_s[mask_ctrl].mean(0)
+        ) + logFC_group
         uv_fc_s = delta_lat_s[mask_disease].mean(0) - delta_lat_s[mask_ctrl].mean(0)
         logFC_s = bio_fc_s - uv_fc_s - logFC_uv_cov
         logFC_posterior[s] = logFC_s
@@ -246,13 +259,16 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
     return pd.DataFrame({
         'gene': gene_names,
         # 生物学贡献
+        'logFC_group': logFC_group,
+        'logFC_bio_latent': logFC_bio_latent,
         'logFC_bio': logFC_bio,
         'logFC_bio_posterior_mean': logFC_posterior.mean(0),
         'logFC_bio_posterior_std': logFC_posterior.std(0),
         'logFC_bio_ci_low': np.percentile(logFC_posterior, 2.5, axis=0),
         'logFC_bio_ci_high': np.percentile(logFC_posterior, 97.5, axis=0),
-        # UV 贡献
-        'logFC_uv_linear': logFC_linear,
+        # UV 贡献；group 已经单独作为生物学效应返回
+        'logFC_uv_group': np.zeros(n_genes),
+        'logFC_uv_linear': logFC_uv_cov,
         'logFC_uv_latent': logFC_uv_latent,
         'logFC_uv_cov': logFC_uv_cov,
         'logFC_uv_total': logFC_uv_total,
