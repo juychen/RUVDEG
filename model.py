@@ -6,24 +6,26 @@ import pandas as pd
 
 
 class ZINBLoss:
-    """Zero-Inflated Negative Binomial loss, similar to scVI.
+    """Zero-Inflated Negative Binomial loss (scVI-style stable formulation).
 
     Models scRNA-seq counts as a mixture of:
-      - A point mass at zero (dropout, with probability pi)
+      - A point mass at zero (zero-inflation, with probability pi_prob = sigmoid(pi))
       - A Negative Binomial (with mean mu and inverse-dispersion theta)
+
+    The implementation mirrors `scvi.distributions.log_zinb_positive` /
+    `log_nb_positive`: pi is parameterised in **logit space** (real support, no
+    sigmoid needed in the decoder), so logits flow through unchanged and the
+    stable `softplus(-pi)` identity is used in place of `log(1 - pi)`. This
+    removes the need for `clamp(pi, eps, 1-eps)`, which would otherwise kill
+    gradients at the saturation tails of the dropout probability.
 
     Usage:
         zinb = ZINBLoss()
-        nll = zinb.log_zinb(x, mu, theta, pi)  # -> negative log-likelihood per gene
+        nll = zinb.nll(x, mu, theta, pi)  # pi is the dropout LOGIT
     """
 
     @staticmethod
-    def _xlogy(x, y):
-        """x * log(y), returns 0 when x == 0 (avoids 0 * -inf = NaN)."""
-        return torch.where(x == 0, torch.zeros_like(x), x * torch.log(y))
-
-    @staticmethod
-    def log_nb(x, mu, theta, eps=1e-6):
+    def log_nb(x, mu, theta, eps=1e-8):
         """Log-probability of the Negative Binomial distribution.
 
         NB(x | mu, theta) = Gamma(x + theta) / (Gamma(theta) * Gamma(x + 1))
@@ -31,57 +33,96 @@ class ZINBLoss:
                             * (mu / (theta + mu))^x
 
         Args:
-            x:     observed counts  (N, G)
-            mu:    NB mean           (N, G)
-            theta: inverse-dispersion (G,) or (N, G)
-            eps:   numerical stability
+            x:     observed counts  (N, G), any non-negative value
+            mu:    NB mean           (N, G), strictly positive
+            theta: inverse-dispersion (G,) or (N, G), strictly positive
+            eps:   numerical stability inside log
         """
         if theta.dim() == 1:
             theta = theta.unsqueeze(0)  # (1, G) -> broadcasts over N
-        softplus_mu = F.softplus(mu) + eps
-        softplus_theta = F.softplus(theta) + eps
 
-        # Use _xlogy for x * log(ratio) to avoid 0 * (-inf) = NaN
-        return (torch.lgamma(x + softplus_theta)
-                - torch.lgamma(softplus_theta)
-                - torch.lgamma(x + 1)
-                + ZINBLoss._xlogy(softplus_theta,
-                                  softplus_theta / (softplus_theta + softplus_mu))
-                + ZINBLoss._xlogy(x,
-                                  softplus_mu / (softplus_theta + softplus_mu)))
+        log_theta_mu_eps = torch.log(theta + mu + eps)
+        return (
+            theta * (torch.log(theta + eps) - log_theta_mu_eps)
+            + x * (torch.log(mu + eps) - log_theta_mu_eps)
+            + torch.lgamma(x + theta)
+            - torch.lgamma(theta)
+            - torch.lgamma(x + 1)
+        )
 
     @staticmethod
-    def log_zinb(x, mu, theta, pi, eps=1e-6):
+    def log_zinb(x, mu, theta, pi, eps=1e-8):
         """Log-probability of the Zero-Inflated Negative Binomial.
 
-        ZINB(x | mu, theta, pi) = pi * I(x == 0) + (1 - pi) * NB(x | mu, theta)
+        ZINB(x | mu, theta, pi) = pi_prob * I(x == 0)
+                                   + (1 - pi_prob) * NB(x | mu, theta)
+        where pi_prob = sigmoid(pi) and **pi is the dropout LOGIT** (any real).
 
-        Uses torch.where to separate zero / non-zero cases — avoids
-        0 * inf = NaN that arises from mask * exp(large_value).
+        The zero / non-zero cases are computed separately and combined with
+        a hard mask (matching scVI). The case_zero branch uses the
+        `log(1 - pi_prob) = -softplus(pi)` and
+        `log(pi_prob + (1-pi_prob) * NB(0)) = softplus(pi_theta_log) - softplus(-pi)`
+        identities, both numerically stable without any clamping.
 
         Args:
-            x:     observed counts  (N, G)
-            mu:    NB mean           (N, G)
-            theta: inverse-dispersion (G,) or (N, G)
-            pi:    dropout probability (N, G), in (0, 1)
-            eps:   numerical stability
+            x:     observed counts  (N, G), any non-negative value
+            mu:    NB mean           (N, G), strictly positive
+            theta: inverse-dispersion (G,) or (N, G), strictly positive
+            pi:    dropout LOGIT  (N, G), real support (decoder outputs raw logits)
+            eps:   numerical stability inside log
         """
-        pi = torch.clamp(pi, eps, 1.0 - eps)
-        nb_ll = ZINBLoss.log_nb(x, mu, theta, eps)
+        if theta.dim() == 1:
+            theta = theta.unsqueeze(0)  # (1, G) -> broadcasts over N
 
-        # At x == 0: ZINB prob = pi + (1-pi) * exp(nb_ll)
-        # At x != 0: ZINB prob = (1-pi) * exp(nb_ll)  --- in log: log(1-pi) + nb_ll
-        # nb_ll is log P(NB), always ≤ 0, so exp(nb_ll) ∈ (0,1] — no overflow
-        log_prob = torch.where(
-            x == 0,
-            torch.log(pi + (1.0 - pi) * torch.exp(nb_ll) + eps),
-            torch.log(1.0 - pi) + nb_ll,
+        # Stable identity: log(sigmoid(pi)) = -softplus(pi).
+        # scVI defines softplus_pi = softplus(-pi), so -softplus_pi = -softplus(-pi)
+        # = pi - softplus(pi) = log(sigmoid(pi)) = log(pi_prob).
+        softplus_pi = F.softplus(-pi)
+
+        log_theta_eps = torch.log(theta + eps)
+        log_theta_mu_eps = torch.log(theta + mu + eps)
+
+        # log(exp(-pi) * NB(0 | mu, theta)) — will be reused in both branches.
+        # NB(0) = (theta / (theta + mu))^theta, so
+        # log NB(0) = theta * (log theta - log(theta + mu)).
+        pi_theta_log = -pi + theta * (log_theta_eps - log_theta_mu_eps)
+
+        # case x == 0:
+        #   log ZINB(0) = log(pi_prob + (1 - pi_prob) * NB(0))
+        #                = softplus(pi_theta_log) - softplus(-pi)        (stable)
+        case_zero = F.softplus(pi_theta_log) - softplus_pi
+        mul_case_zero = (x < eps).to(mu.dtype) * case_zero
+
+        # case x > 0:
+        #   log ZINB(x) = log(1 - pi_prob) + log NB(x)
+        #               = -softplus(pi) + pi_theta_log + x*(log mu - log(theta+mu))
+        #                  + lgamma(x+theta) - lgamma(theta) - lgamma(x+1)
+        # nb-style lgamma terms live in `log_nb_positive`; we inline them here
+        # so we only carry the NB-specific theta piece plus one extra `-pi`
+        # (absorbed into `pi_theta_log`) instead of the full log NB twice.
+        lgamma_x_theta = torch.lgamma(x + theta)
+        lgamma_theta = torch.lgamma(theta)
+        lgamma_x_plus_1 = torch.lgamma(x + 1)
+        case_non_zero = (
+            -softplus_pi
+            + pi_theta_log
+            + x * (torch.log(mu + eps) - log_theta_mu_eps)
+            + lgamma_x_theta
+            - lgamma_theta
+            - lgamma_x_plus_1
         )
-        return log_prob
+        mul_case_non_zero = (x > eps).to(mu.dtype) * case_non_zero
+
+        return mul_case_zero + mul_case_non_zero
 
     @staticmethod
-    def nll(x, mu, theta, pi, eps=1e-6):
-        """Negative log-likelihood (scalar mean over all entries)."""
+    def nll(x, mu, theta, pi, eps=1e-8):
+        """Mean negative log-likelihood (scalar).
+
+        Args:
+            pi: dropout LOGIT (real support) — the decoder should output raw
+                logits, NOT probabilities. See `log_zinb` for details.
+        """
         ll = ZINBLoss.log_zinb(x, mu, theta, pi, eps)
         return -ll.mean()
 
@@ -138,14 +179,16 @@ class RUVVAE_DEG(nn.Module):
         # ---- ZINB 相关参数 (类似 scVI) ----
         if use_zinb:
             # 基因特异性逆离散度 (inverse-dispersion / r), 类似 scVI 的 px_r
-            self.px_r = nn.Parameter(torch.ones(n_genes))
-            # 零膨胀 (dropout) 解码器: 从生物隐变量 z 预测每个基因的 dropout 概率
+            # 前向时通过 F.softplus(self.px_r) 保证正性 (scVI 风格: theta = exp(px_r))
+            self.px_r = nn.Parameter(torch.zeros(n_genes))
+            # 零膨胀 (dropout) 解码器: 从生物隐变量 z 预测每个基因的 dropout
+            # 注意 — 输出是 **logits** (real support)，而不是概率 (与 scVI 一致)，
+            # 这样 ZINBLoss 可以用 softplus(-pi) 的稳定形式，无需 clamp。
             self.decoder_dropout = nn.Sequential(
                 nn.Linear(d_bio, 256), nn.GELU(),
-                nn.Linear(256, n_genes),
-                nn.Sigmoid()  # pi ∈ (0, 1)
+                nn.Linear(256, n_genes)  # no Sigmoid — pi 是 logit
             )
-            # NOTE: ZINB 均值复用 RUV 分解: mu = softplus(y_bio - delta_lat - delta_cov)
+            # NOTE: ZINB 均值复用 RUV 分解: mu = exp(y_bio - delta_lat - delta_cov)
             # decoder_bio, decoder_w, W_group, W_cov 全部参与 ZINB 重建，不另设 decoder_mu
     
     def reparameterize(self, mu, logvar):
@@ -178,25 +221,32 @@ class RUVVAE_DEG(nn.Module):
         delta_cov = self.compute_delta_cov(c_dict)
 
         if self.use_zinb:
-            # ---- ZINB 模式: 复用 RUV 分解 ----
-            # ZINB 均值基于 RUV 分解: mu = softplus(y_bio - delta_lat - delta_cov)
-            # 这样 decoder_bio, decoder_w, W_group, W_cov 全部被 ZINB loss 训练
-            y_mu = F.softplus(y_bio - delta_lat - delta_cov) + 1e-6  # (N, G), >0
+            # ---- ZINB 模式 (scVI 风格): 复用 RUV 分解 ----
+            # ZINB 均值基于 RUV 分解: log_mu = y_bio - delta_lat - delta_cov
+            # 用 exp 而非 softplus: counts 高达 4774, softplus(8)=8 太小, exp(8)=2980 匹配
+            # decoder_bio, decoder_w, W_group, W_cov 全部被 ZINB loss 训练
+            log_mu = y_bio - delta_lat - delta_cov
+            y_mu = torch.exp(log_mu) + 1e-6  # (N, G), >0, natural count scale
 
-            # 零膨胀概率: 从 z 预测 (生物学隐变量驱动 dropout)
-            pi = self.decoder_dropout(z)  # (N, G), ∈ (0,1)
-            theta = self.px_r             # (G,), 基因特异性逆离散度
+            # scVI 风格: theta 来自 F.softplus(self.px_r)，保证 >0；
+            # self.px_r 以 zeros 初始化，softplus(0)=log(2)≈0.69，对 NB 是一个温和起点。
+            theta = F.softplus(self.px_r)  # (G,)
+            # decoder_dropout 输出 logits (real support)，与 scVI 的 px_dropout 对齐。
+            # 不再 clamp / sigmoid: ZINBLoss.log_zinb 用 -softplus(-pi) 的稳定形式。
+            pi_logit = self.decoder_dropout(z)  # (N, G)
+            pi_prob = torch.sigmoid(pi_logit)   # 仅用于 E[ZINB] / 调试
 
             losses = {
-                'recon': ZINBLoss.nll(y, y_mu, theta, pi),
+                'recon': ZINBLoss.nll(y, y_mu, theta, pi_logit),
                 'kl_z': -0.5 * torch.mean(1 + z_logvar - z_mu.pow(2)
                                          - z_logvar.exp()),
                 'kl_w': -0.5 * torch.mean(1 + w_logvar - w_mu.pow(2)
                                          - w_logvar.exp()),
             }
-            # y_recon = NB mean adjusted for dropout (expected ZINB count)
-            y_recon = y_mu * (1.0 - pi)
-            dropout = pi
+            # E[ZINB] = mu * (1 - pi_prob) = mu * sigmoid(-pi_logit)
+            # 用 sigmoid(-logit) 而不是 (1 - sigmoid)，数值等价但更容易反向传播。
+            y_recon = y_mu * torch.sigmoid(-pi_logit)
+            dropout = pi_prob
         else:
             # ---- MSE 模式 (原始) ----
             y_recon = y_bio - delta_lat - delta_cov
