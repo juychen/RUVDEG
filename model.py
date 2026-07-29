@@ -261,9 +261,14 @@ class RUVVAE_DEG(nn.Module):
 
         if neg_control_mask is not None:
             delta_total = delta_lat + delta_cov
+            # NC 约束: Δ_total 只学跨样本 UV 变异, 不学基线表达。
+            # NC 基因的全局均值 (= 内参基线) 交给 y_bio 保留。
+            # 这样  y_bio[nc] = nc_mean (跨样本稳定), 不是 0。
+            y_nc = y[:, neg_control_mask]
+            nc_mean = y_nc.mean(dim=0, keepdim=True)  # (1, n_nc)
             losses['nc_total'] = F.mse_loss(
                 delta_total[:, neg_control_mask],
-                y[:, neg_control_mask]
+                y_nc - nc_mean
             )
 
         result = {'y_recon': y_recon, 'y_bio': y_bio,
