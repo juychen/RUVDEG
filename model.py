@@ -225,7 +225,7 @@ class RUVVAE_DEG(nn.Module):
             # ZINB 均值基于 RUV 分解: log_mu = y_bio - delta_lat - delta_cov
             # 用 exp 而非 softplus: counts 高达 4774, softplus(8)=8 太小, exp(8)=2980 匹配
             # decoder_bio, decoder_w, W_group, W_cov 全部被 ZINB loss 训练
-            log_mu = y_bio - delta_lat - delta_cov
+            log_mu = y_bio + delta_lat + delta_cov
             y_mu = torch.exp(log_mu) + 1e-6  # (N, G), >0, natural count scale
 
             # scVI 风格: theta 来自 F.softplus(self.px_r)，保证 >0；
@@ -249,7 +249,7 @@ class RUVVAE_DEG(nn.Module):
             dropout = pi_prob
         else:
             # ---- MSE 模式 (原始) ----
-            y_recon = y_bio - delta_lat - delta_cov
+            y_recon = y_bio + delta_lat + delta_cov
             losses = {
                 'recon': F.mse_loss(y_recon, y),
                 'kl_z': -0.5 * torch.mean(1 + z_logvar - z_mu.pow(2)
