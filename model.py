@@ -260,6 +260,7 @@ class RUVVAE_DEG(nn.Module):
             dropout = None
 
         if neg_control_mask is not None:
+            #delta_total = delta_lat + delta_cov
             delta_total = delta_lat + delta_cov
             # NC 约束: Δ_total 只学跨样本 UV 变异, 不学基线表达。
             # NC 基因的全局均值 (= 内参基线) 交给 y_bio 保留。
