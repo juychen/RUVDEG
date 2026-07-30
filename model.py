@@ -507,6 +507,135 @@ def compute_deg_all_methods_legacy(model, Y, gene_names, group_labels, groups_un
 
 
 @torch.no_grad()
+def _mast_lrt_vectorized(y_dis, y_ctr, threshold=0.0):
+    """Vectorised MAST-style likelihood ratio test for a two-group comparison.
+
+    Faithfully reproduces the formulas from ``MAST::lrtest`` (see the in-repo
+    ``lrtest.R``): the test statistic is a sum of two independent components
+
+        * ``binom`` (chi^2_1): differential detection rate
+          (Bernoulli: 1 if the cell expresses the gene at level > ``threshold``)
+        * ``norm``  (chi^2_1): differential mean expression *among the cells that
+          express the gene* (Gaussian on the positive observations)
+        * ``comb``  (chi^2_2): the combined hurdle test (binom + norm)
+
+    The combined statistic follows ``-2 * (binom + norm) ~ chi^2(2)`` under H0
+    ("the two groups come from the same model"). The dirction of the effect is
+    reported per-component (+1 if the disease group has the higher value, -1
+    otherwise) and for the combined test we keep the sign of whichever
+    component contributed the larger share.
+
+    Args:
+        y_dis:    (n_disease, n_genes) expression matrix, log1p scale.
+        y_ctr:    (n_ctrl,    n_genes) expression matrix, log1p scale.
+        threshold: log1p threshold separating "expressed" from "not expressed".
+
+    Returns:
+        dict with per-gene arrays (shape (n_genes,)): lrstat / lrstat_binom /
+        lrstat_norm, p_value / p_value_binom / p_value_norm, direction /
+        direction_binom / direction_norm, plus n_expressed_disease and
+        n_expressed_ctrl.
+    """
+    from scipy import stats as _stats
+
+    eps = 1e-12
+    y_dis = np.asarray(y_dis, dtype=np.float64)
+    y_ctr = np.asarray(y_ctr, dtype=np.float64)
+    if y_dis.shape[1] != y_ctr.shape[1]:
+        raise ValueError("y_dis and y_ctr must have the same number of genes")
+    n_dis, n_genes = y_dis.shape
+    n_ctr = y_ctr.shape[0]
+
+    w_dis = (y_dis > threshold).astype(np.float64)              # (n_dis, G)
+    w_ctr = (y_ctr > threshold).astype(np.float64)              # (n_ctr, G)
+    e_dis = w_dis.sum(axis=0)                                    # (G,)
+    e_ctr = w_ctr.sum(axis=0)                                    # (G,)
+
+    pos_dis = np.where(w_dis > 0, y_dis, 0.0)
+    pos_ctr = np.where(w_ctr > 0, y_ctr, 0.0)
+    sum_dis = pos_dis.sum(axis=0)
+    sum_ctr = pos_ctr.sum(axis=0)
+
+    e_dis_safe = e_dis + eps
+    e_ctr_safe = e_ctr + eps
+    denom_e = e_dis + e_ctr + eps
+
+    p_0 = (e_dis + e_ctr) / (n_dis + n_ctr)
+    p_dis = e_dis / n_dis
+    p_ctr = e_ctr / n_ctr
+
+    m_0 = (sum_dis + sum_ctr) / denom_e
+    mu_dis = sum_dis / e_dis_safe
+    mu_ctr = sum_ctr / e_ctr_safe
+
+    ss_dis = ((mu_dis - y_dis) ** 2 * w_dis).sum(axis=0)
+    ss_ctr = ((mu_ctr - y_ctr) ** 2 * w_ctr).sum(axis=0)
+    t_num = e_dis * e_ctr / denom_e * (mu_dis - mu_ctr) ** 2
+    t_den = ss_dis + ss_ctr + eps
+    Tstar = 1.0 + t_num / t_den
+    Tstar = np.where(np.isfinite(Tstar) & (Tstar > 0), Tstar, 1.0)
+
+    def _log_prod(m, k):
+        """m*log(k), but defined as 0 when m == 0 (matching MAST's logProd)."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = m * np.log(k)
+        v = np.where(np.isfinite(v), v, 0.0)
+        return np.where(m > 0, v, 0.0)
+
+    binom = (
+        _log_prod(e_dis,        p_0 / (p_dis + eps))
+        + _log_prod(e_ctr,      p_0 / (p_ctr + eps))
+        + _log_prod(n_dis - e_dis, (1.0 - p_0) / (1.0 - p_dis + eps))
+        + _log_prod(n_ctr - e_ctr, (1.0 - p_0) / (1.0 - p_ctr + eps))
+    )
+
+    norm = -(e_dis + e_ctr) / 2.0 * np.log(Tstar)
+
+    # chi^2 statistics: -2 * logLR ~ chi^2(df)
+    # When a component is degenerate (e.g. no expressing cells in one group),
+    # MAST would return NA; here we keep the running total well-defined.
+    binom_lrstat = -2.0 * binom
+    norm_lrstat = -2.0 * norm
+    binom_lrstat = np.where(np.isfinite(binom_lrstat), binom_lrstat, 0.0)
+    norm_lrstat = np.where(np.isfinite(norm_lrstat), norm_lrstat, 0.0)
+    binom_lrstat = np.clip(binom_lrstat, 0.0, None)
+    norm_lrstat = np.clip(norm_lrstat, 0.0, None)
+
+    comb_lrstat = binom_lrstat + norm_lrstat
+
+    binom_pval = _stats.chi2.sf(binom_lrstat, df=1)
+    norm_pval = _stats.chi2.sf(norm_lrstat, df=1)
+    comb_pval = _stats.chi2.sf(comb_lrstat, df=2)
+
+    binom_pval = np.where(np.isfinite(binom_pval), binom_pval, 1.0)
+    norm_pval = np.where(np.isfinite(norm_pval), norm_pval, 1.0)
+    comb_pval = np.where(np.isfinite(comb_pval), comb_pval, 1.0)
+
+    binom_dir = np.where(p_ctr >= p_dis, 1.0, -1.0)
+    norm_dir = np.where(mu_ctr >= mu_dis, 1.0, -1.0)
+    # "maxsign" in MAST: pick the sign of whichever component contributed the
+    # more extreme logLR for the combined test.
+    comb_dir = np.where(binom >= norm, binom_dir, norm_dir)
+
+    return {
+        "lrstat": comb_lrstat,
+        "lrstat_binom": binom_lrstat,
+        "lrstat_norm": norm_lrstat,
+        "p_value": comb_pval,
+        "p_value_binom": binom_pval,
+        "p_value_norm": norm_pval,
+        "direction": comb_dir,
+        "direction_binom": binom_dir,
+        "direction_norm": norm_dir,
+        "n_expressed_disease": e_dis,
+        "n_expressed_ctrl": e_ctr,
+        "frac_detected_disease": p_dis,
+        "frac_detected_ctrl": p_ctr,
+        "mean_pos_disease": mu_dis,
+        "mean_pos_ctrl": mu_ctr,
+    }
+
+
 def compute_deg(model, Y, gene_names, group_labels, groups_unique,
                 neg_control_mask, batch_labels=None, n_genes_on=None,
                 method="wald", n_posterior=200, n_perm=500):
@@ -514,11 +643,15 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
 
     ``wald`` is the default and the closest option here to DESeq2's Wald-test
     idea, but it is not a negative-binomial GLM and is not DESeq2 itself.
-    Other options are ``welch``, ``permutation``, ``bayes``, and ``all``.
+    Other options are ``welch``, ``permutation``, ``lrt``, ``bayes``, and
+    ``all``. ``lrt`` runs the MAST-style hurdle likelihood ratio test
+    (see ``_mast_lrt_vectorized``) on the model's UV-removed biological
+    expression ``y_bio`` and stores the binom / norm / combined components
+    in dedicated columns for downstream inspection.
     """
     from scipy import stats as _stats
 
-    allowed_methods = {"wald", "welch", "permutation", "bayes", "all"}
+    allowed_methods = {"wald", "welch", "permutation", "bayes", "lrt", "all"}
     if method not in allowed_methods:
         raise ValueError(
             f"Unknown DEG method {method!r}; choose one of {sorted(allowed_methods)}"
@@ -575,8 +708,11 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
     if n_ctrl < 2 or n_disease < 2:
         raise ValueError("Each group needs at least two samples for DEG inference")
 
-    delta_lat = out["delta_lat"].cpu().numpy()
-    delta_cov = out["delta_cov"].cpu().numpy()
+    # `model()` is called outside of `torch.no_grad()` in some notebooks; under
+    # autograd-tracking mode every output tensor still carries a grad fn. We
+    # detach before going to numpy to keep the inference path agnostic.
+    delta_lat = out["delta_lat"].detach().cpu().numpy()
+    delta_cov = out["delta_cov"].detach().cpu().numpy()
     logFC_uv_latent = (
         delta_lat[mask_disease].mean(0) - delta_lat[mask_ctrl].mean(0)
     )
@@ -595,11 +731,11 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
 
     W_group = model.W_group.detach().cpu().numpy()
     logFC_group = W_group[1] - W_group[0]
-    y_bio_base = out["y_bio_base"].cpu().numpy()
+    y_bio_base = out["y_bio_base"].detach().cpu().numpy()
     logFC_bio_latent = (
         y_bio_base[mask_disease].mean(0) - y_bio_base[mask_ctrl].mean(0)
     )
-    y_bio = out["y_bio"].cpu().numpy()
+    y_bio = out["y_bio"].detach().cpu().numpy()
     logFC_bio = logFC_group + logFC_bio_latent
 
     y_bio_dis = y_bio[mask_disease]
@@ -626,8 +762,8 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
     extra = {
         "W_group": W_group,
         "y_bio": y_bio,
-        "w_mu": out["w_mu"].cpu().numpy(),
-        "z_mu": out["z_mu"].cpu().numpy(),
+        "w_mu": out["w_mu"].detach().cpu().numpy(),
+        "z_mu": out["z_mu"].detach().cpu().numpy(),
         "delta_lat": delta_lat,
         "delta_cov": delta_cov,
     }
@@ -668,6 +804,39 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
         p_value = (count_ge + 1) / (n_perm + 1)
         data["p_value_perm"] = np.clip(p_value, 1e-300, 1.0)
 
+    elif method == "lrt":
+        # MAST-style hurdle-model likelihood ratio test on the UV-removed
+        # biological expression (`y_bio`). Following MAST::lrtest in `lrtest.R`
+        # we threshold at 0 (i.e. log1p(count) > 0 iff count > 0) to flag
+        # "expressing" cells, then compute
+        #   binom: chi^2_1 test on detection rates
+        #   norm : chi^2_1 test on positive-cell means
+        #   comb : chi^2_2 combined hurdle test  <-- the headline p-value
+        lrt_out = _mast_lrt_vectorized(y_bio_dis, y_bio_ctr, threshold=0.0)
+        test_stat = lrt_out["lrstat"]
+        p_value = lrt_out["p_value"]
+        data["p_value_lrt"] = np.clip(p_value, 1e-300, 1.0)
+        data["p_value_lrt_binom"] = np.clip(lrt_out["p_value_binom"], 1e-300, 1.0)
+        data["p_value_lrt_norm"] = np.clip(lrt_out["p_value_norm"], 1e-300, 1.0)
+        data["lrstat_lrt_binom"] = lrt_out["lrstat_binom"]
+        data["lrstat_lrt_norm"] = lrt_out["lrstat_norm"]
+        data["direction_lrt_binom"] = lrt_out["direction_binom"]
+        data["direction_lrt_norm"] = lrt_out["direction_norm"]
+        data["n_expressed_disease"] = lrt_out["n_expressed_disease"]
+        data["n_expressed_ctrl"] = lrt_out["n_expressed_ctrl"]
+        data["frac_detected_disease"] = lrt_out["frac_detected_disease"]
+        data["frac_detected_ctrl"] = lrt_out["frac_detected_ctrl"]
+        data["mean_pos_disease"] = lrt_out["mean_pos_disease"]
+        data["mean_pos_ctrl"] = lrt_out["mean_pos_ctrl"]
+        extra["lrt_components"] = {
+            "lrstat_binom": lrt_out["lrstat_binom"],
+            "lrstat_norm": lrt_out["lrstat_norm"],
+            "p_value_binom": lrt_out["p_value_binom"],
+            "p_value_norm": lrt_out["p_value_norm"],
+            "direction_binom": lrt_out["direction_binom"],
+            "direction_norm": lrt_out["direction_norm"],
+        }
+
     else:  # bayes
         if n_posterior <= 0:
             raise ValueError("n_posterior must be positive for method='bayes'")
@@ -681,8 +850,8 @@ def compute_deg(model, Y, gene_names, group_labels, groups_unique,
             w_sample = w_mu + torch.exp(0.5 * w_logvar) * torch.randn_like(w_mu)
             y_bio_sample = (
                 model.decoder_bio(z_sample) + model.bias
-            ).cpu().numpy()
-            delta_lat_sample = model.decoder_w(w_sample).cpu().numpy()
+            ).detach().cpu().numpy()
+            delta_lat_sample = model.decoder_w(w_sample).detach().cpu().numpy()
             bio_fc_sample = (
                 y_bio_sample[mask_disease].mean(0)
                 - y_bio_sample[mask_ctrl].mean(0)
