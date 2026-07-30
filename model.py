@@ -169,12 +169,23 @@ class RUVVAE_DEG(nn.Module):
                                          nn.Linear(256, n_genes))
         self.decoder_w = nn.Sequential(nn.Linear(k_unk, 256), nn.GELU(),
                                        nn.Linear(256, n_genes))
-        # 显式协变量矩阵
+        # 显式协变量矩阵 (batch 走 sample_emb; n_genes_on 仍保留线性协变量)
         self.W_cov = nn.ParameterDict({
             name: nn.Parameter(torch.randn(dim, n_genes) * 0.01)
             for name, dim in cov_blocks.items()
         })
         self.bias = nn.Parameter(torch.zeros(n_genes))
+
+        # ---- per-sample (donor) UV embedding ----
+        # Each row is a (n_genes,) UV pattern for a specific sample / donor /
+        # batch. Cells from the same sample share the same row by indexing
+        # via `c_dict["batch"].argmax(-1)` (the standard "sample embedding"
+        # trick). shape (n_batch, n_genes) is independent of n_cell, so it
+        # scales with the number of samples (~7) rather than cells (~1e4).
+        if n_batch > 0:
+            self.sample_emb = nn.Parameter(torch.randn(n_batch, n_genes) * 0.01)
+        else:
+            self.sample_emb = None
 
         # ---- ZINB 相关参数 (类似 scVI) ----
         if use_zinb:
@@ -217,7 +228,15 @@ class RUVVAE_DEG(nn.Module):
         y_bio_base = self.decoder_bio(z) + self.bias
         group_effect = c_dict["group"] @ self.W_group
         y_bio = y_bio_base + group_effect
-        delta_lat = self.decoder_w(w)
+        # Per-sample UV (the main "跨 donor per-gene" term) plus the latent
+        # residual for whatever the sample label doesn't explain.
+        delta_lat_residual = self.decoder_w(w)
+        if self.sample_emb is not None and "batch" in c_dict:
+            batch_one_hot = c_dict["batch"]                # (N, n_batch)
+            batch_idx = batch_one_hot.argmax(dim=-1)        # (N,)
+            delta_lat = self.sample_emb[batch_idx] + delta_lat_residual
+        else:
+            delta_lat = delta_lat_residual
         delta_cov = self.compute_delta_cov(c_dict)
 
         if self.use_zinb:
