@@ -30,6 +30,16 @@ parser.add_argument(
     help="get_normalized_expression / posterior_predictive_sample 的 transform_batch 标签",
 )
 parser.add_argument(
+    "--no-batch",
+    action="store_true",
+    help="不使用 batch key（batch_key=None，无 batch 校正）。此时 --transform-batch 会被忽略。",
+)
+parser.add_argument(
+    "--no-cont-cov",
+    action="store_true",
+    help="不使用连续协变量（CONT_COVS=None），不向 SCVI 传入任何 covariate。",
+)
+parser.add_argument(
     "--n-latent", type=int, default=32,
     help="latent 维度（默认 32）",
 )
@@ -41,9 +51,13 @@ args, _ = parser.parse_known_args()
 
 INPUT_H5AD = os.path.abspath(args.input)
 OUTPREFIX = os.path.abspath(args.outprefix)
-TRANSFORM_BATCH = args.transform_batch
 N_LATENT = args.n_latent
 N_LAYERS = args.n_layers
+USE_BATCH = not args.no_batch
+USE_CONT_COVS = not args.no_cont_cov
+
+# 使用 batch key 时 transform_batch 有效；不使用 batch 时必须为 None
+TRANSFORM_BATCH = args.transform_batch if USE_BATCH else None
 
 # Strip the extension so all outputs share one base path: <base>.<suffix>
 OUTBASE = os.path.splitext(OUTPREFIX)[0]
@@ -53,7 +67,8 @@ os.makedirs(OUTDIR, exist_ok=True)
 print(f"input h5ad : {INPUT_H5AD}")
 print(f"out prefix : {OUTPREFIX}")
 print(f"out base   : {OUTBASE}")
-print(f"transform  : {TRANSFORM_BATCH}  |  n_latent={N_LATENT}  n_layers={N_LAYERS}")
+print(f"transform  : {TRANSFORM_BATCH}  |  n_latent={N_LATENT}  n_layers={N_LAYERS}"
+      f"  |  use_batch={USE_BATCH}  use_cont_cov={USE_CONT_COVS}")
 
 # ===== 数据读取 =====
 adata_subset = sc.read_h5ad(INPUT_H5AD)
@@ -71,19 +86,23 @@ for col in ["status", "company", "celltype.L2", "sex", "sample", "region"]:
 # === 5. n_genes_on 协变量（mirror RUVDEG cell 4） ===
 # 用 raw counts 计算每个细胞 >0 的基因数，标准化后作为连续 nuisance covariate。
 # 与 RUVDEG 完全一致：mean/std 由本次数据估计，z-score 后写入 adata.obs["n_genes_on"]。
-n_genes_on_raw = (adata_subset.layers["counts"] > 0).sum(axis=1).astype(np.float32)
-n_genes_on_mean = float(n_genes_on_raw.mean())
-n_genes_on_std  = float(n_genes_on_raw.std())
-if n_genes_on_std < 1e-8:
-    raise ValueError("n_genes_on 没有足够变异，无法作为连续协变量")
+# 仅在 --no-cont-cov 未开启（USE_CONT_COVS=True）时才需要计算。
+if USE_CONT_COVS:
+    n_genes_on_raw = (adata_subset.layers["counts"] > 0).sum(axis=1).astype(np.float32)
+    n_genes_on_mean = float(n_genes_on_raw.mean())
+    n_genes_on_std  = float(n_genes_on_raw.std())
+    if n_genes_on_std < 1e-8:
+        raise ValueError("n_genes_on 没有足够变异，无法作为连续协变量")
 
-adata_subset.obs["n_genes_on"] = (
-    (n_genes_on_raw - n_genes_on_mean) / n_genes_on_std
-).astype(np.float32)
+    adata_subset.obs["n_genes_on"] = (
+        (n_genes_on_raw - n_genes_on_mean) / n_genes_on_std
+    ).astype(np.float32)
 
-print(f"raw mean / std    : {n_genes_on_mean:.1f} / {n_genes_on_std:.1f}")
-print(f"standardized range: [{adata_subset.obs['n_genes_on'].min():.3f}, "
-      f"{adata_subset.obs['n_genes_on'].max():.3f}]")
+    print(f"raw mean / std    : {n_genes_on_mean:.1f} / {n_genes_on_std:.1f}")
+    print(f"standardized range: [{adata_subset.obs['n_genes_on'].min():.3f}, "
+          f"{adata_subset.obs['n_genes_on'].max():.3f}]")
+else:
+    print("⚠ --no-cont-cov: 跳过 n_genes_on 计算，不传入任何连续协变量")
 
 
 # %%
@@ -100,13 +119,15 @@ adata_subset.X = adata_subset.layers["counts"].copy()
 # 不传 labels_key：本数据只含单个 L2 细胞类型，且 labels_key 语义上是细胞类型标签、
 # 不是 biology-of-interest，作 covariate-as-label 会语义错误。
 
-BATCH_KEY = "company"
-CONT_COVS = ["n_genes_on"]
+# --no-batch 时 BATCH_KEY=None：scvi 不注册 batch 字段，模型完全不使用 batch
+# --no-cont-cov 时 CONT_COVS=None：scvi 不注册任何连续协变量
+BATCH_KEY = "company" if USE_BATCH else None
+CONT_COVS = ["n_genes_on"] if USE_CONT_COVS else None
 
 scvi.model.SCVI.setup_anndata(
     adata_subset,
     layer=None,                              # raw counts 在 adata.X
-    batch_key=BATCH_KEY,                     # technical nuisance (RUVDEG `batch`)
+    batch_key=BATCH_KEY,                     # technical nuisance (RUVDEG `batch`)；--no-batch 时为 None
     labels_key=None,                         # no cell-type label here
     categorical_covariate_keys=None,         # no extra categorical nuisance
     continuous_covariate_keys=CONT_COVS,     # technical continuous nuisance (RUVDEG `n_genes_on`)
@@ -180,6 +201,16 @@ comparisons = [
 deg_results = {}
 for label, gb, g1, g2 in comparisons:
     print(f"\n>>> {label}:  {g1} vs {g2}  (groupby={gb})")
+
+    # 检查 g1 / g2 组是否有细胞：某些样本可能缺少某个 status（如 ICTX 没有 CURES），
+    # 若任一组细胞数为 0 则跳过该比较
+    vc = adata_de.obs[gb].astype(str).value_counts()
+    g1_groups = [g1] if isinstance(g1, str) else list(g1)
+    missing = [g for g in g1_groups + [g2] if int(vc.get(g, 0)) == 0]
+    if missing:
+        print(f"  ⚠ skip {label}: 以下组没有细胞 -> {missing}  (细胞数: {dict(vc)})")
+        continue
+
     deg = model.differential_expression(
         adata=adata_de,
         groupby=gb,
@@ -187,7 +218,7 @@ for label, gb, g1, g2 in comparisons:
         group2=g2,
         mode="change",
         delta=0.1,
-        batch_correction=True,
+        batch_correction=USE_BATCH,
         silent=False,
     )
     deg = deg.copy()
@@ -224,23 +255,31 @@ print(summary)
 deg_all[deg_all.lfc_median.abs() > 0.1].group1.value_counts()
 
 # %%
-batch_idx = model.adata_manager.get_from_registry("batch")
-cont_cov = model.adata_manager.get_from_registry("extra_continuous_covs")
-cont_cov = torch.as_tensor(
-    pd.DataFrame(cont_cov).to_numpy(dtype=np.float32),
-    device=next(model.module.parameters()).device,
+# 未使用 batch key（--no-batch）时没有 batch registry，跳过；
+# 未使用连续协变量（--no-cont-cov）时没有 extra_continuous_covs registry，跳过。
+batch_idx = model.adata_manager.get_from_registry("batch") if USE_BATCH else None
+cont_cov = (
+    model.adata_manager.get_from_registry("extra_continuous_covs") if USE_CONT_COVS else None
 )
+if cont_cov is not None:
+    cont_cov = torch.as_tensor(
+        pd.DataFrame(cont_cov).to_numpy(dtype=np.float32),
+        device=next(model.module.parameters()).device,
+    )
 
 
 # %%
-adata_subset.obs['batch_idx'] = batch_idx
+if USE_BATCH:
+    adata_subset.obs['batch_idx'] = batch_idx
 
 # %%
 
-batch_map = dict(zip(adata_subset.obs['company'].values, adata_subset.obs['batch_idx'].values))
+if USE_BATCH:
+    batch_map = dict(zip(adata_subset.obs['company'].values, adata_subset.obs['batch_idx'].values))
 
 # %%
-batch_map
+if USE_BATCH:
+    batch_map
 
 # %%
 X_norm = model.get_normalized_expression(
@@ -326,8 +365,11 @@ for g in hkg_priority:
 print(f"HKG available: {len(hkg_genes)} / {len(set(hkg_priority))}")
 
 # 2) status 排序为 5 类固定顺序
+#    用 set_categories 而非 reorder_categories：某些数据（如 ICTX）缺少某个 status
+#    （例如没有 CURES），reorder_categories 要求新旧类别一致会报错；
+#    set_categories 允许缺失类别，只强制固定顺序。
 adata_subset.obs["status"] = adata_subset.obs["status"].astype("category")
-adata_subset.obs["status"] =adata_subset.obs["status"].cat.reorder_categories(
+adata_subset.obs["status"] = adata_subset.obs["status"].cat.set_categories(
     ["CON", "CURES", "CUSUS", "CSRES", "CSSUS"]
 )
 

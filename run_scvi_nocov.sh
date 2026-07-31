@@ -12,13 +12,13 @@ set -euo pipefail
 # ---- Config (edit here) ----
 SCRIPT="/home/junyichen/code/RUVAEDEG/scVI.py"
 INPUT_DIR="/data7/mark/STG/dataset/snRNA/merge_SCH_new/six_datasets_4v3_500_1000gene"
-OUT_DIR="/data3/junyi/scvi"
+OUT_DIR="/data3/junyi/scvi_nocov"
 TRANSFORM_BATCH="beirui"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
-
-#ALL_REGIONS=(iCTX TH STR PFC MB HY HPF AMY)
-ALL_REGIONS=(iCTX)
+mkdir -p "$OUT_DIR"
+ALL_REGIONS=(iCTX TH STR PFC MB HY HPF AMY)
+#ALL_REGIONS=(iCTX)
 
 # ---- Optional conda env ----
 # Hardcoded source line removed: activation is handled here so the script
@@ -53,6 +53,8 @@ run_one() {
     python "$SCRIPT" \
         -i "$input" \
         -o "$outprefix" \
+        --no-batch \
+        --no-cont-cov \
         --transform-batch "$TRANSFORM_BATCH" \
         >"$log" 2>&1
     local rc=$?
