@@ -265,12 +265,12 @@ adata_subset.obsm['X_harmony'] = ho.Z_corr
 # adata_concat.obs['umap_0'] = adata_concat.obsm['X_umap'][:, 0]
 # adata_concat.obs['umap_1'] = adata_concat.obsm['X_umap'][:, 1]
 # 
-
+adata_subset.write_h5ad(OUTBASE + ".h5ad", compression="gzip")
 import torch
 import numpy as np
 
 
-def decode_from_z(model, adata, z, library_size=None, batch_size=512):
+def decode_from_z(model, adata, z, library_size=None, device="cpu"):
     """用自定义 latent z 直接跑 decoder（generative），返回 ZINB 分布。
 
     Parameters
@@ -292,26 +292,31 @@ def decode_from_z(model, adata, z, library_size=None, batch_size=512):
         px.mean    得到 (n_cells, n_genes) 期望表达（rate）
     """
     module = model.module
-    z = torch.as_tensor(np.asarray(z, dtype=np.float32))
+    module.eval()  # 关闭 dropout/BN 训练态，保证确定性 decode
+    module.to(device)  # 移到目标设备（默认 CPU：释放 GPU 显存，避免全量采样 OOM）
+
+    z = torch.as_tensor(np.asarray(z, dtype=np.float32), device=device)
 
     # batch_index：SCVI 未注册 batch（本 pipeline 恒为 None），恒用全 0
-    batch_index = torch.zeros((adata.n_obs, 1), dtype=torch.long)
+    batch_index = torch.zeros((adata.n_obs, 1), dtype=torch.long, device=device)
 
     # library：观测 library size（log 尺度），decoder 内部 exp(library)*px_scale
     if library_size is None:
         counts = adata.layers["counts"] if "counts" in adata.layers else adata.X
         lib = np.asarray(counts.sum(axis=1)).ravel()
-        library = torch.log(torch.tensor(lib, dtype=torch.float32)).unsqueeze(1)
+        library = torch.log(
+            torch.tensor(lib, dtype=torch.float32, device=device)
+        ).unsqueeze(1)
     else:
         library = torch.log(
-            torch.tensor(np.asarray(library_size, dtype=np.float32))
+            torch.tensor(np.asarray(library_size, dtype=np.float32), device=device)
         ).unsqueeze(1)
 
     # cont_covs：USE_CONT_COVS 时从 registry 取连续协变量编码，否则 None
     if USE_CONT_COVS:
         cont_cov = model.adata_manager.get_from_registry("extra_continuous_covs")
         cont_covs = torch.as_tensor(
-            pd.DataFrame(cont_cov).to_numpy(dtype=np.float32)
+            pd.DataFrame(cont_cov).to_numpy(dtype=np.float32), device=device
         )
     else:
         cont_covs = None
@@ -324,6 +329,70 @@ def decode_from_z(model, adata, z, library_size=None, batch_size=512):
             cont_covs=cont_covs,
         )
     return gen_out["px"]  # px: ZINB 分布
+
+
+def decode_sample_from_z(model, adata, z, library_size=None, batch_size=2048, device="cpu"):
+    """分块 decode + 抽样 counts，避免一次性物化全量 (n_cells, n_genes) 导致 GPU/内存 OOM。
+
+    等价于 decode_from_z(model, adata, z).sample()，但按 batch_size 分块进行，
+    每块只持有 (batch_size, n_genes) 的中间张量，峰值内存大幅降低。
+
+    Parameters
+    ----------
+    model : scvi.model.SCVI（训练后）
+    adata : AnnData（与模型 setup 结构一致）
+    z : (n_cells, n_latent) 数组 —— 自定义 latent
+    library_size : (n_cells,) 或 None（同 decode_from_z）
+    batch_size : int，每块细胞数（默认 2048）
+    device : str，decode 所在设备。默认 "cpu"：
+        模型在 GPU 上训练，decode 时把 module 移到 CPU 可立即释放显存，
+        也避免全量采样再次撑爆 GPU（默认最稳；显存充足可传 device="cuda" 加速）。
+
+    Returns
+    -------
+    np.ndarray of shape (n_cells, n_genes) —— counts 抽样（等价于 posterior predictive sample）
+    """
+    module = model.module
+    module.eval()
+    module.to(device)
+
+    z = torch.as_tensor(np.asarray(z, dtype=np.float32), device=device)
+    n = adata.n_obs
+
+    batch_index = torch.zeros((n, 1), dtype=torch.long, device=device)
+
+    if library_size is None:
+        counts = adata.layers["counts"] if "counts" in adata.layers else adata.X
+        lib = np.asarray(counts.sum(axis=1)).ravel()
+        library = torch.log(
+            torch.tensor(lib, dtype=torch.float32, device=device)
+        ).unsqueeze(1)
+    else:
+        library = torch.log(
+            torch.tensor(np.asarray(library_size, dtype=np.float32), device=device)
+        ).unsqueeze(1)
+
+    if USE_CONT_COVS:
+        cont_cov = model.adata_manager.get_from_registry("extra_continuous_covs")
+        cont_covs = torch.as_tensor(
+            pd.DataFrame(cont_cov).to_numpy(dtype=np.float32), device=device
+        )
+    else:
+        cont_covs = None
+
+    samples = []
+    with torch.inference_mode():
+        for i in range(0, n, batch_size):
+            j = min(i + batch_size, n)
+            px = module.generative(
+                z=z[i:j],
+                library=library[i:j],
+                batch_index=batch_index[i:j],
+                cont_covs=cont_covs[i:j] if cont_covs is not None else None,
+            )["px"]
+            samples.append(px.sample().cpu())
+
+    return torch.cat(samples, dim=0).numpy()
 
 
 def normalized_expression_from_z(model, adata, z, lib_size=1):
@@ -360,14 +429,18 @@ def normalized_expression_from_z(model, adata, z, lib_size=1):
 # %%
 # === 演示：用指定 z 直接 decode / 归一化表达 ===
 
+# 0) 训练结束后释放 PyTorch 缓存的显存（训练占用了 GPU 5 大量显存）
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
 # 1) 用 harmony 校正后的 z（或 X_scVI latent mean）
 z_custom = adata_subset.obsm["X_harmony"]  # (n_cells, n_latent)
 
-# 2) decode：返回 ZINB 分布
+# 2) decode：返回 ZINB 分布（默认移到 CPU 执行，释放 GPU 显存）
 px = decode_from_z(model, adata_subset, z_custom)
 
-# 3) 从分布抽样 counts（等价于"指定 z 的 posterior predictive sample"）
-recon_custom = px.sample().cpu().numpy()
+# 3) 从分布抽样 counts —— 分块抽样，避免全量 (n_cells, n_genes) 在 GPU 上 OOM
+recon_custom = decode_sample_from_z(model, adata_subset, z_custom, batch_size=512)
 print(f"reconstructed shape: {recon_custom.shape}")
 print(f"range: [{recon_custom.min()}, {recon_custom.max()}]  median={np.median(recon_custom):.2f}")
 print(f"fraction non-zero: {(recon_custom > 0).mean():.3f}")
