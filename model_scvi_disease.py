@@ -42,6 +42,7 @@ Usage
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 
@@ -275,17 +276,100 @@ class SCVIWithDiseaseEffect(SCVI):
         )
         return mu_scvi * mu_disease
 
-    def get_disease_logfc(self) -> np.ndarray:
-        """Return the per-gene disease log-fold-change.
+    def get_disease_logfc_by_group(
+        self,
+        control_group: int | str = 0,
+        group_names: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """Return disease effects for every label versus one control label.
 
-        Defined as ``W_group[disease] - W_group[control]`` where the control
-        is the **first** category of the ``labels_key`` column (the order is
-        the one registered by ``setup_anndata``). Shape ``(n_genes,)``.
+        Parameters
+        ----------
+        control_group
+            Control label index or category name. Defaults to the first label.
+        group_names
+            Optional label names. If omitted, they are read from the SCVI
+            labels registry.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One row per gene and one ``logFC_<group>_vs_<control>`` column per
+            label. The control column is zero by definition.
         """
-        W = self.module.W_group.detach().cpu().numpy()  # (n_labels, n_genes)
+        W = self.module.W_group.detach().cpu().numpy()
         if W.shape[0] < 2:
             raise ValueError(
-                "Need at least 2 disease groups (labels) to compute a logFC; "
-                f"got n_labels={W.shape[0]}. Set `labels_key` in setup_anndata."
+                "Need at least 2 disease groups (labels); "
+                f"got n_labels={W.shape[0]}. Set labels_key in setup_anndata."
             )
-        return W[1] - W[0]
+
+        if group_names is None:
+            registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
+            group_names = [str(x) for x in registry.categorical_mapping]
+        else:
+            group_names = [str(x) for x in group_names]
+        if len(group_names) != W.shape[0]:
+            raise ValueError(
+                f"group_names has {len(group_names)} labels, but W_group has "
+                f"{W.shape[0]} rows."
+            )
+
+        if isinstance(control_group, str):
+            if control_group not in group_names:
+                raise ValueError(
+                    f"Unknown control group {control_group!r}; "
+                    f"available groups: {group_names}"
+                )
+            control_idx = group_names.index(control_group)
+        else:
+            control_idx = int(control_group)
+            if not 0 <= control_idx < len(group_names):
+                raise ValueError(
+                    f"control_group index {control_idx} is out of range for "
+                    f"{len(group_names)} groups."
+                )
+
+        control_name = group_names[control_idx]
+        effects = W - W[control_idx][None, :]
+        gene_names = np.asarray(self.adata.var_names).astype(str)
+        result = pd.DataFrame({"gene": gene_names})
+        for idx, group_name in enumerate(group_names):
+            result[f"logFC_{group_name}_vs_{control_name}"] = effects[idx]
+        return result
+
+    def get_disease_logfc(
+        self,
+        disease_group: int | str | None = None,
+        control_group: int | str = 0,
+    ) -> np.ndarray:
+        """Return one disease logFC vector for backward compatibility.
+
+        For multiple disease groups, pass ``disease_group`` explicitly. Use
+        :meth:`get_disease_logfc_by_group` to retrieve all contrasts at once.
+        """
+        effects = self.get_disease_logfc_by_group(control_group=control_group)
+        effect_columns = [c for c in effects.columns if c.startswith("logFC_")]
+        if disease_group is None:
+            if len(effect_columns) != 2:
+                raise ValueError(
+                    "Multiple disease groups detected. Pass disease_group or "
+                    "call get_disease_logfc_by_group()."
+                )
+            disease_group = effect_columns[1].split("_vs_")[0].removeprefix("logFC_")
+        if isinstance(disease_group, int):
+            group_name = list(self.adata_manager.get_state_registry(
+                REGISTRY_KEYS.LABELS_KEY
+            ).categorical_mapping)[disease_group]
+        else:
+            group_name = str(disease_group)
+        column = next(
+            (c for c in effect_columns if c.startswith(f"logFC_{group_name}_vs_")),
+            None,
+        )
+        if column is None:
+            raise ValueError(
+                f"Unknown disease group {disease_group!r}; "
+                f"available columns: {effect_columns}"
+            )
+        return effects[column].to_numpy()
