@@ -12,10 +12,10 @@ set -euo pipefail
 # ---- Config (edit here) ----
 SCRIPT="/home/junyichen/code/RUVAEDEG/scviHarmony.py"
 INPUT_DIR="/data7/mark/STG/dataset/snRNA/merge_SCH_new/six_datasets_4v3_500_1000gene"
-OUT_DIR="/data3/junyi/scvi_harmony"
+OUT_DIR="/data3/junyi/scvi_harmony10"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
-NCLUST="celltype.L2"
+NCLUST="10"
 HARMONY_BATCH="company"
 LAMB=0.3
 MAX_ITER_HARMONY=20

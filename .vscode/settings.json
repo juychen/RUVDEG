@@ -1,5 +1,11 @@
 {
     "workbench.colorTheme": "Solarized Dark",
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "chat.tools.terminal.autoApprove": {
+        "/^python3 -c \"\nimport json\nnb = json\\.load\\(open\\('/home/junyichen/code/RUVAEDEG/slide_figs/60_SummerizeHigenes\\.ipynb'\\)\\)\n# Print top-level keys and vscode metadata\nprint\\('Top keys:', list\\(nb\\.keys\\(\\)\\)\\)\nif 'metadata' in nb:\n    print\\('Metadata keys:', list\\(nb\\['metadata'\\]\\.keys\\(\\)\\)\\)\n    if 'vscode' in nb\\['metadata'\\]:\n        print\\('VSCode metadata:', json\\.dumps\\(nb\\['metadata'\\]\\['vscode'\\], indent=2\\)\\[:2000\\]\\)\n\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
 }
