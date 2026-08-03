@@ -154,7 +154,7 @@ def parse_args():
                         help="图片尺寸 (宽 高)，默认 20 70")
     parser.add_argument("--font", default="/data2st1/junyi/arial.ttf",
                         help="字体文件路径")
-    parser.add_argument("--layer", default=None,
+    parser.add_argument("--layer", default="scvi_reconstructed_counts_harmony",
                         help="dotplot 可视化使用的 layer 名，例如 counts / "
                              "scvi_reconstructed_counts / scvi_reconstructed_counts_harmony / "
                              "count_diff。不传则使用 adata.X（默认行为）。")

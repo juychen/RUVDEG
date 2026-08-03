@@ -13,8 +13,8 @@ set -euo pipefail
 
 # ---- Config (edit here) ----
 SCRIPT="/home/junyichen/code/RUVAEDEG/darw_gene.py"
-INPUT_DIR="/data3/junyi/scvi_harmony"           # each region's h5ad lives here
-OUT_DIR="/data3/junyi/scvi_harmony/dotplots"     # dotplot pdfs will be saved here
+INPUT_DIR="/data3/junyi/scvi"           # each region's h5ad lives here
+OUT_DIR="/data3/junyi/scvi/dotplots"     # dotplot pdfs will be saved here
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
 
@@ -25,7 +25,7 @@ GROUPBY="sample_status"
 STANDARD_SCALE="var"
 FIGSIZE="20 20"
 FONT="/data2st1/junyi/arial.ttf"
-LAYER="scvi_reconstructed_counts_harmony"
+LAYER="scvi_reconstructed_counts"
 
 ALL_REGIONS=(iCTX TH STR PFC MB HY HPF AMY)
 #ALL_REGIONS=(iCTX)
@@ -80,7 +80,7 @@ run_one() {
     return $rc
 }
 export -f run_one
-export SCRIPT INPUT_DIR OUT_DIR GENEGROUP MAX_GENES GROUPBY STANDARD_SCALE FIGSIZE FONT
+export SCRIPT INPUT_DIR OUT_DIR GENEGROUP MAX_GENES GROUPBY STANDARD_SCALE FIGSIZE FONT LAYER
 
 # ---- Region selection ----
 if [[ $# -gt 0 ]]; then
