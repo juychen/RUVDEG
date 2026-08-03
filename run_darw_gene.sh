@@ -12,7 +12,7 @@
 set -euo pipefail
 
 # ---- Config (edit here) ----
-SCRIPT="/home/junyichen/code/RUVAEDEG/slide_figs/darw_gene.py"
+SCRIPT="/home/junyichen/code/RUVAEDEG/darw_gene.py"
 INPUT_DIR="/data3/junyi/scvi_harmony"           # each region's h5ad lives here
 OUT_DIR="/data3/junyi/scvi_harmony/dotplots"     # dotplot pdfs will be saved here
 MAX_JOBS=4
@@ -23,8 +23,9 @@ GENEGROUP="${GENEGROUP:-/data2st2/junyi/code/sn/data/All_degs_N_v0715FF.xlsx}"
 MAX_GENES=50
 GROUPBY="sample_status"
 STANDARD_SCALE="var"
-FIGSIZE="20 70"
+FIGSIZE="20 20"
 FONT="/data2st1/junyi/arial.ttf"
+LAYER="scvi_reconstructed_counts_harmony"
 
 ALL_REGIONS=(iCTX TH STR PFC MB HY HPF AMY)
 #ALL_REGIONS=(iCTX)
@@ -66,6 +67,7 @@ run_one() {
         --max-genes "$MAX_GENES" \
         --groupby "$GROUPBY" \
         --standard-scale "$STANDARD_SCALE" \
+        --layer "$LAYER" \
         --figsize $FIGSIZE \
         --font "$FONT" \
         >"$log" 2>&1

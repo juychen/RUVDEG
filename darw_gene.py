@@ -38,7 +38,8 @@ def dotplot_by_region(sub_dict, genes,
                       hspace=-0.1,
                       out_path='/data2st2/junyi/output/dotplot_by_region.pdf',
                       show=False,
-                      max_genes=50):
+                      max_genes=50,
+                      layer=None):
     """
     利用 sub_dict（已按脑切分好的子集 dict）绘制各脑区 dotplot，纵向拼接。
     参数:
@@ -52,6 +53,7 @@ def dotplot_by_region(sub_dict, genes,
         show     : 是否 plt.show()
         max_genes : int, 单个图中最多基因数。有效基因数超过该值时自动分批绘制，
                     每批仍用相同 figsize，输出文件名追加 _part01/_part02 等后缀。
+        layer    : str 或 None，dotplot 可视化使用的 layer 名（None=adata.X）。
     返回:
         分批时返回 (list_of_figs, None)；否则返回 (fig, axes)
     """
@@ -77,7 +79,8 @@ def dotplot_by_region(sub_dict, genes,
                 sub_dict, batch_genes, adata_full=adata_full,
                 groupby=groupby, standard_scale=standard_scale,
                 figsize=figsize, hspace=hspace,
-                out_path=batch_out, show=show, max_genes=max_genes)
+                out_path=batch_out, show=show, max_genes=max_genes,
+                layer=layer)
             figs.append(fig)
         return figs, None
 
@@ -105,6 +108,7 @@ def dotplot_by_region(sub_dict, genes,
         sub.obs['sample_status'] = sub.obs['sample_status'].astype('category')
         sc.tl.dendrogram(sub, groupby=groupby)
         sc.pl.dotplot(sub, var_names=genes_plot, groupby=groupby,
+                      layer=layer,
                       standard_scale=standard_scale, dendrogram=True,
                       vmin=vmin_g, vmax=vmax_g, show=False, ax=ax)
 
@@ -150,6 +154,10 @@ def parse_args():
                         help="图片尺寸 (宽 高)，默认 20 70")
     parser.add_argument("--font", default="/data2st1/junyi/arial.ttf",
                         help="字体文件路径")
+    parser.add_argument("--layer", default=None,
+                        help="dotplot 可视化使用的 layer 名，例如 counts / "
+                             "scvi_reconstructed_counts / scvi_reconstructed_counts_harmony / "
+                             "count_diff。不传则使用 adata.X（默认行为）。")
     return parser.parse_args()
 
 
@@ -182,6 +190,17 @@ def main():
     # ---------- 读取输入 adata ----------
     ad_all = sc.read(args.input)
     print(f"已读取 adata: {args.input}, shape={ad_all.shape}")
+
+    # ---------- 校验可视化 layer ----------
+    if args.layer is None:
+        print(f"[layer] 使用 adata.X（默认）")
+    else:
+        if args.layer not in ad_all.layers:
+            raise ValueError(
+                f"--layer={args.layer!r} 不在 adata.layers 中。"
+                f" 可选: {list(ad_all.layers.keys())}"
+            )
+        print(f"[layer] 使用 adata.layers[{args.layer!r}]")
 
     # ---------- 内参基因 ----------
     hkgene = ['Rpl13a', 'Rplp0', 'Rps18', 'Rps27a', 'Rps23', 'Rps29', 'Rpl32',
@@ -216,6 +235,7 @@ def main():
             standard_scale=args.standard_scale,
             figsize=tuple(args.figsize),
             max_genes=args.max_genes,
+            layer=args.layer,
             out_path=os.path.join(args.output, f'dotplot_{name}_per_region.pdf'))
 
     # ---------- 按 DML2 基因分组绘制（可选） ----------
@@ -269,6 +289,7 @@ def main():
                 standard_scale=args.standard_scale,
                 figsize=tuple(args.figsize),
                 max_genes=args.max_genes,
+                layer=args.layer,
                 show=False,
                 out_path=os.path.join(args.output, f'dotplot_DML2_{safe_name}_per_region.pdf'))
 

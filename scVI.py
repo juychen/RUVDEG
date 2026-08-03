@@ -11,6 +11,26 @@ import seaborn as sns
 import torch
 from rich import print
 from scipy.stats import false_discovery_control
+from scipy.sparse import csr_matrix
+
+
+def to_sparse_int(arr):
+    """把 numpy / float / 稀疏数组转换成 (n_cells, n_genes) 的 csr int 矩阵。
+
+    - 输入若为稀疏矩阵：保持格式，只把 dtype 转成 int32。
+    - 输入若为稠密 ndarray：rint 截断后构造 csr（counts 必须是离散整数）。
+    - 用于把 decoder 抽样得到的 counts 写入 adata.layers["..."]，避免 h5ad
+      把 float 数组按 ~8 字节/元素存储（counts 通常很稀疏 + 数值小）。
+    """
+    import numpy as np
+    from scipy.sparse import csr_matrix, issparse
+    if issparse(arr):
+        return csr_matrix(arr).astype(np.int32)
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        # 防御性：误传 1D 时强制 reshape 成单行矩阵
+        arr = arr.reshape(1, -1)
+    return csr_matrix(np.rint(arr).astype(np.int32))
 
 # ===== 命令行参数（可通过 argv 覆盖；在 Jupyter 中运行时自动使用默认值） =====
 parser = argparse.ArgumentParser(description="SCVI DEG pipeline (RUVDEG mirror)")
@@ -307,8 +327,8 @@ print(f"reconstructed shape: {reconstructed.shape}  dtype={reconstructed.dtype}"
 print(f"range: [{reconstructed.min()}, {reconstructed.max()}]  median={np.median(reconstructed):.2f}")
 print(f"fraction non-zero: {(reconstructed > 0).mean():.3f}")
 
-# 3) 写回 adata
-adata_subset.layers["scvi_reconstructed_counts"] = reconstructed
+# 3) 写回 adata —— 稀疏 int 矩阵，节省 h5ad 存储
+adata_subset.layers["scvi_reconstructed_counts"] = to_sparse_int(reconstructed)
 
 
 
@@ -417,7 +437,9 @@ fig_out = OUTBASE + ".raw_status.png"
 fig.savefig(fig_out, bbox_inches="tight", dpi=200)
 print(f"✓ saved: {fig_out}")
 
-adata_subset.layers["count_diff"] = adata_subset.layers["scvi_reconstructed_counts"] - adata_subset.layers["counts"]
+adata_subset.layers["count_diff"] = to_sparse_int(
+    adata_subset.layers["scvi_reconstructed_counts"] - adata_subset.layers["counts"]
+)
 fig = sc.pl.dotplot(
     adata_subset,
     var_names=hkg_genes,
