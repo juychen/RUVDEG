@@ -9,6 +9,7 @@ __pycache__/
 build/
 dist/
 .eggs/
+.headroom
 
 # Virtual environments
 .venv/
