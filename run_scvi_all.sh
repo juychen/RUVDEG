@@ -11,14 +11,17 @@ set -euo pipefail
 
 # ---- Config (edit here) ----
 SCRIPT="/home/junyichen/code/RUVAEDEG/scVI.py"
-INPUT_DIR="/data7/mark/STG/dataset/snRNA/merge_SCH_new/six_datasets_4v3_500_1000gene"
-OUT_DIR="/data3/junyi/scvi"
+INPUT_DIRS=(
+    "/data8/junyi/CUSUS_3v3_500_1000gene_new"
+    "/data8/junyi/CURES_3v3_500_1000gene_new"
+)
+OUT_ROOT="/data3/junyi"
 TRANSFORM_BATCH="beirui"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
 
-#ALL_REGIONS=(iCTX TH STR PFC MB HY HPF AMY)
-ALL_REGIONS=(iCTX)
+ALL_REGIONS=(TH STR PFC MB HY HPF AMY)
+#ALL_REGIONS=(iCTX)
 
 # ---- Optional conda env ----
 # Hardcoded source line removed: activation is handled here so the script
@@ -35,14 +38,19 @@ python -c "import scvi" >/dev/null 2>&1 || {
     exit 1
 }
 
-mkdir -p "$OUT_DIR"
-
-# ---- One job per region ----
+# ---- One job per input directory and region ----
 run_one() {
-    local region="$1"
-    local input="${INPUT_DIR}/${region}_downsampled_ratio.h5ad"
-    local outprefix="${OUT_DIR}/${region}_scVImodel.h5ad"
-    local log="${OUT_DIR}/${region}_scvi.log"
+    local input_dir="$1"
+    local region="$2"
+    local dataset
+    dataset="$(basename "$input_dir")"
+    dataset="${dataset%_new}"
+    local out_dir="${OUT_ROOT}/${dataset}_scvi"
+    local input="${input_dir}/${region}.h5ad"
+    local outprefix="${out_dir}/${region}_scVI.h5ad"
+    local log="${out_dir}/${region}_scvi.log"
+
+    mkdir -p "$out_dir"
 
     if [[ ! -f "$input" ]]; then
         echo "[SKIP] input not found: $input" >&2
@@ -64,7 +72,7 @@ run_one() {
     return $rc
 }
 export -f run_one
-export SCRIPT INPUT_DIR OUT_DIR TRANSFORM_BATCH
+export SCRIPT OUT_ROOT TRANSFORM_BATCH
 
 # ---- Main ----
 if [[ $# -gt 0 ]]; then
@@ -73,8 +81,15 @@ else
     REGIONS=("${ALL_REGIONS[@]}")
 fi
 
-echo "[CONFIG] script=$SCRIPT  max_jobs=$MAX_JOBS  out_dir=$OUT_DIR"
-printf '%s\n' "${REGIONS[@]}" \
-    | xargs -P "$MAX_JOBS" -I{} bash -c 'run_one "$1"' _ {}
+echo "[CONFIG] script=$SCRIPT  max_jobs=$MAX_JOBS  input_dirs=${#INPUT_DIRS[@]}"
+for input_dir in "${INPUT_DIRS[@]}"; do
+    if [[ ! -d "$input_dir" ]]; then
+        echo "[WARN] input directory not found: $input_dir" >&2
+        continue
+    fi
+    for region in "${REGIONS[@]}"; do
+        printf '%s\t%s\n' "$input_dir" "$region"
+    done
+done | xargs -P "$MAX_JOBS" -n 2 bash -c 'run_one "$1" "$2"' _
 
 echo "[ALL] finished"
