@@ -476,7 +476,7 @@ adata_subset.layers["scvi_reconstructed_counts_harmony"] = to_sparse_int(recon_c
 #    lib_size=1   -> 相对表达（每细胞行和=1）
 #    lib_size=1e4 -> 每 1 万 counts 的标准化表达（同官方常用调用）
 X_norm_harmony = normalized_expression_from_z(
-    model, adata_subset, z_custom, lib_size=1e4
+    model, adata_subset, z_custom, lib_size=1e6
 )
 print(f"normalized shape: {X_norm_harmony.shape}")
 print(f"row sum (lib_size=1e4): {X_norm_harmony.sum(axis=1).mean():.0f}")

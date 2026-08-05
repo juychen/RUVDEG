@@ -218,61 +218,61 @@ comparisons = [
     ("CSRES_vs_CON",  "status",      ["CSRES"], "CON"),
 ]
 
-deg_results = {}
-for label, gb, g1, g2 in comparisons:
-    print(f"\n>>> {label}:  {g1} vs {g2}  (groupby={gb})")
+# deg_results = {}
+# for label, gb, g1, g2 in comparisons:
+#     print(f"\n>>> {label}:  {g1} vs {g2}  (groupby={gb})")
 
-    # 检查 g1 / g2 组是否有细胞：某些样本可能缺少某个 status（如 ICTX 没有 CURES），
-    # 若任一组细胞数为 0 则跳过该比较
-    vc = adata_de.obs[gb].astype(str).value_counts()
-    g1_groups = [g1] if isinstance(g1, str) else list(g1)
-    missing = [g for g in g1_groups + [g2] if int(vc.get(g, 0)) == 0]
-    if missing:
-        print(f"  ⚠ skip {label}: 以下组没有细胞 -> {missing}  (细胞数: {dict(vc)})")
-        continue
+#     # 检查 g1 / g2 组是否有细胞：某些样本可能缺少某个 status（如 ICTX 没有 CURES），
+#     # 若任一组细胞数为 0 则跳过该比较
+#     vc = adata_de.obs[gb].astype(str).value_counts()
+#     g1_groups = [g1] if isinstance(g1, str) else list(g1)
+#     missing = [g for g in g1_groups + [g2] if int(vc.get(g, 0)) == 0]
+#     if missing:
+#         print(f"  ⚠ skip {label}: 以下组没有细胞 -> {missing}  (细胞数: {dict(vc)})")
+#         continue
 
-    deg = model.differential_expression(
-        adata=adata_de,
-        groupby=gb,
-        group1=g1,
-        group2=g2,
-        mode="change",
-        delta=0.1,
-        batch_correction=USE_BATCH,
-        silent=False,
-    )
-    deg = deg.copy()
-    deg.index.name = "gene"
-    deg = deg.reset_index()
-    deg["comparison"] = label
-    deg["fdr"] = false_discovery_control(deg["proba_de"].values)
-    deg_results[label] = deg
+#     deg = model.differential_expression(
+#         adata=adata_de,
+#         groupby=gb,
+#         group1=g1,
+#         group2=g2,
+#         mode="change",
+#         delta=0.1,
+#         batch_correction=USE_BATCH,
+#         silent=False,
+#     )
+#     deg = deg.copy()
+#     deg.index.name = "gene"
+#     deg = deg.reset_index()
+#     deg["comparison"] = label
+#     deg["fdr"] = false_discovery_control(deg["proba_de"].values)
+#     deg_results[label] = deg
 
-deg_all = pd.concat(deg_results.values(), ignore_index=True)
-deg_csv = OUTBASE + ".deg_4comparisons.csv"
-deg_all.to_csv(deg_csv, index=False)
-print(f"✓ saved: {deg_csv}")
+# deg_all = pd.concat(deg_results.values(), ignore_index=True)
+# deg_csv = OUTBASE + ".deg_4comparisons.csv"
+# deg_all.to_csv(deg_csv, index=False)
+# print(f"✓ saved: {deg_csv}")
 
-summary = (
-    deg_all.groupby("comparison")
-    .agg(
-        n_genes=("gene", "size"),
-        n_de_fdr05=("fdr", lambda s: int((s < 0.05).sum())),
-        n_up_lfc1=(
-            "lfc_mean",
-            lambda s: int(((deg_all.loc[s.index, "fdr"] < 0.05) & (s > 1)).sum()),
-        ),
-        n_down_lfc1=(
-            "lfc_mean",
-            lambda s: int(((deg_all.loc[s.index, "fdr"] < 0.05) & (s < -1)).sum()),
-        ),
-    )
-)
-print("\n=== DEG 摘要 ===")
-print(summary)
+# summary = (
+#     deg_all.groupby("comparison")
+#     .agg(
+#         n_genes=("gene", "size"),
+#         n_de_fdr05=("fdr", lambda s: int((s < 0.05).sum())),
+#         n_up_lfc1=(
+#             "lfc_mean",
+#             lambda s: int(((deg_all.loc[s.index, "fdr"] < 0.05) & (s > 1)).sum()),
+#         ),
+#         n_down_lfc1=(
+#             "lfc_mean",
+#             lambda s: int(((deg_all.loc[s.index, "fdr"] < 0.05) & (s < -1)).sum()),
+#         ),
+#     )
+# )
+# print("\n=== DEG 摘要 ===")
+# print(summary)
 
-# %%
-deg_all[deg_all.lfc_median.abs() > 0.1].group1.value_counts()
+# # %%
+# deg_all[deg_all.lfc_median.abs() > 0.1].group1.value_counts()
 
 # %%
 # 未使用 batch key（--no-batch）时没有 batch registry，跳过；
@@ -303,7 +303,7 @@ if USE_BATCH:
 
 # %%
 X_norm = model.get_normalized_expression(
-    lib_size=1e4, transform_batch=TRANSFORM_BATCH
+    lib_size=1e6, transform_batch=TRANSFORM_BATCH
 )
 adata_subset.layers["scvi_nrom_counts"] = X_norm
 
