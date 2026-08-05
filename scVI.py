@@ -303,7 +303,7 @@ if USE_BATCH:
 
 # %%
 X_norm = model.get_normalized_expression(
-    lib_size=1e6, transform_batch=TRANSFORM_BATCH
+    lib_size=1e4, transform_batch=TRANSFORM_BATCH
 )
 adata_subset.layers["scvi_nrom_counts"] = X_norm
 
