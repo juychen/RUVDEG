@@ -13,19 +13,18 @@ set -euo pipefail
 SCRIPT="/home/junyichen/code/RUVAEDEG/scVI.py"
 INPUT_DIRS=(
     "/data8/junyi/CUSUS_3v3_500_1000gene_new"
-    "/data8/junyi/CURES_3v3_500_1000gene_new"
 )
 OUT_ROOT="/data3/junyi"
 TRANSFORM_BATCH="beirui"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
 
-ALL_REGIONS=(TH STR PFC MB HY HPF AMY)
+ALL_REGIONS=(PFC AMY)
 #ALL_REGIONS=(iCTX)
 
 # ---- Optional conda env ----
 # Hardcoded source line removed: activation is handled here so the script
-# works with any conda install and can be disabled by setting CONDA_ENV="".
+# works with any conda install and can be disabled by setting CONDA_ENV"".
 if [[ -n "$CONDA_ENV" ]] && command -v conda >/dev/null 2>&1; then
     # shellcheck disable=SC1091
     source "$(conda info --base)/etc/profile.d/conda.sh"

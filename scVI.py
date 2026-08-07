@@ -93,6 +93,26 @@ print(f"transform  : {TRANSFORM_BATCH}  |  n_latent={N_LATENT}  n_layers={N_LAYE
 # ===== 数据读取 =====
 adata_subset = sc.read_h5ad(INPUT_H5AD)
 
+# transform_batch 必须是当前数据中实际存在的 company；缺失时使用细胞数最多的 company。
+if USE_BATCH:
+    if "company" not in adata_subset.obs.columns:
+        raise KeyError("使用 batch 校正时，adata.obs 必须包含 'company' 列")
+
+    company_counts = adata_subset.obs["company"].dropna().astype(str).value_counts()
+    if company_counts.empty:
+        raise ValueError("adata.obs['company'] 没有有效值，无法选择 transform_batch")
+
+    if TRANSFORM_BATCH not in company_counts.index:
+        requested_transform_batch = TRANSFORM_BATCH
+        TRANSFORM_BATCH = company_counts.index[0]
+        print(
+            f"⚠ transform_batch={requested_transform_batch!r} 不在当前数据中，"
+            f"改用细胞数最多的 company={TRANSFORM_BATCH!r} "
+            f"(n={company_counts.iloc[0]})"
+        )
+
+print(f"resolved transform_batch: {TRANSFORM_BATCH!r}")
+
 # 关键列 value counts —— 与 RUVDEG 一致的元信息
 for col in ["status", "company", "celltype.L2", "sex", "sample", "region"]:
     if col in adata_subset.obs.columns:
