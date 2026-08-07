@@ -16,7 +16,7 @@ dist/
 venv/
 env/
 ENV/
-
+.*/
 # Jupyter / Notebook
 .ipynb_checkpoints/
 *.ipynb_checkpoints
