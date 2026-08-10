@@ -53,3 +53,12 @@ adata_cache/
 .env
 .env.local
 *.local.yml
+
+# Project subdirectories
+.claude/
+.kilo/
+__pycache__/
+ppt_figs/
+scvi-tools/
+scviRUV_output.model/
+slide_figs/
