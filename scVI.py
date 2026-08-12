@@ -67,6 +67,10 @@ parser.add_argument(
     "--n-layers", type=int, default=2,
     help="编码器/解码器层数（默认 2）",
 )
+parser.add_argument(
+    "--no-compare", action="store_true",
+    help="跳过末尾的 HKG dotplot（仍会训练、抽样并写 h5ad）",
+)
 args, _ = parser.parse_known_args()
 
 INPUT_H5AD = os.path.abspath(args.input)
@@ -75,6 +79,7 @@ N_LATENT = args.n_latent
 N_LAYERS = args.n_layers
 USE_BATCH = not args.no_batch
 USE_CONT_COVS = not args.no_cont_cov
+SHOW_COMPARE = not args.no_compare
 
 # 使用 batch key 时 transform_batch 有效；不使用 batch 时必须为 None
 TRANSFORM_BATCH = args.transform_batch if USE_BATCH else None
@@ -219,24 +224,24 @@ adata_subset.obsm[SCVI_LATENT_KEY] = model.get_latent_representation()
 #   CSDS_vs_CON   : (CSRES ∪ CSSUS) vs CON
 #   CSRES_vs_CON  : CSRES vs CON        (CSDS+抗压 vs 对照)
 
-status = adata_subset.obs["status"].astype(str)
-print("status counts:")
-print(status.value_counts())
+# status = adata_subset.obs["status"].astype(str)
+# print("status counts:")
+# print(status.value_counts())
 
-adata_de = adata_subset.copy()
-adata_de.obs["status_3grp"] = np.where(
-    status.isin(["CSRES", "CSSUS"]), "CSDS",
-    np.where(status == "CON", "CON", status),
-).astype(str)
-print("\nstatus_3grp counts:")
-print(adata_de.obs["status_3grp"].value_counts())
+# adata_de = adata_subset.copy()
+# adata_de.obs["status_3grp"] = np.where(
+#     status.isin(["CSRES", "CSSUS"]), "CSDS",
+#     np.where(status == "CON", "CON", status),
+# ).astype(str)
+# print("\nstatus_3grp counts:")
+# print(adata_de.obs["status_3grp"].value_counts())
 
-comparisons = [
-    ("RES_vs_CON",    "status",      ["CURES"], "CON"),
-    ("SUS_vs_CON",    "status",      ["CUSUS"], "CON"),
-    ("CSDS_vs_CON",   "status_3grp", ["CSDS"],  "CON"),
-    ("CSRES_vs_CON",  "status",      ["CSRES"], "CON"),
-]
+# comparisons = [
+#     ("RES_vs_CON",    "status",      ["CURES"], "CON"),
+#     ("SUS_vs_CON",    "status",      ["CUSUS"], "CON"),
+#     ("CSDS_vs_CON",   "status_3grp", ["CSDS"],  "CON"),
+#     ("CSRES_vs_CON",  "status",      ["CSRES"], "CON"),
+# ]
 
 # deg_results = {}
 # for label, gb, g1, g2 in comparisons:
@@ -349,7 +354,12 @@ print(f"fraction non-zero: {(reconstructed > 0).mean():.3f}")
 
 # 3) 写回 adata —— 稀疏 int 矩阵，节省 h5ad 存储
 adata_subset.layers["scvi_reconstructed_counts"] = to_sparse_int(reconstructed)
+adata_subset.write_h5ad(OUTBASE + ".h5ad", compression="gzip")
+print(f"✓ saved: {OUTBASE}.h5ad")
 
+if not SHOW_COMPARE:
+    print("⚠ --no-compare: skip HKG dotplot")
+    raise SystemExit(0)
 
 
 # %%
@@ -477,7 +487,4 @@ fig = sc.pl.dotplot(
 fig_out = OUTBASE + ".count_diff.png"
 fig.savefig(fig_out, bbox_inches="tight", dpi=200)
 print(f"✓ saved: {fig_out}")
-
-adata_subset.write_h5ad(OUTBASE + ".h5ad", compression="gzip")
-print(f"✓ saved: {OUTBASE}.h5ad")
 

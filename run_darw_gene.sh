@@ -14,8 +14,8 @@ set -euo pipefail
 
 # ---- Config (edit here) ----
 SCRIPT="/home/junyichen/code/RUVAEDEG/draw_neggene.py"
-INPUT_DIR="${INPUT_DIR:-/data3/junyi/scvi_harmony}"          # folder containing *.h5ad
-OUT_DIR="${OUT_DIR:-/data3/junyi/scvi_harmony/dotplots}"     # dotplot pdfs saved here
+INPUT_DIR="${INPUT_DIR:-/data3/junyi/scvi}"          # folder containing *.h5ad
+OUT_DIR="${OUT_DIR:-/data3/junyi/scvi/dotplots}"     # dotplot pdfs saved here
 CONDA_ENV="scvi-env"          # empty = use current python
 
 # draw_neggene.py specific defaults (can be overridden via env vars)
@@ -25,7 +25,7 @@ GROUPBY="${GROUPBY:-sample_status}"
 STANDARD_SCALE="${STANDARD_SCALE:-var}"
 FIGSIZE="${FIGSIZE:-20 70}"
 FONT="${FONT:-/data2st1/junyi/arial.ttf}"
-LAYER="${LAYER:-scvi_reconstructed_counts_harmony}"  # layer to plot (default: scvi_reconstructed_counts_harmony)
+LAYER="${LAYER:-scvi_reconstructed_counts}"  # layer to plot (default: scvi_reconstructed_counts_harmony)
 VMAX="${VMAX:-1}"              # empty = auto global p95
 VMIN="${VMIN:-0}"
 
