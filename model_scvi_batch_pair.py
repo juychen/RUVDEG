@@ -106,66 +106,79 @@ def _cross_batch_pair_mse(
                 f"got {tuple(cell_type_idx.shape)} vs {tuple(batch_idx.shape)}"
             )
 
-    pair_sq = []
-    n_pairs = 0
+    # Encode each (cell_type, batch) group as one integer. For the untyped
+    # case, all cells belong to one type. This lets us aggregate with
+    # index_add_ instead of materialising every cell-cell pair.
+    if cell_type_idx is None:
+        type_idx = torch.zeros_like(batch_idx)
+    else:
+        type_idx = cell_type_idx
 
-    # ---- (a) Iterate over cell types when cell_type_idx is given ----
-    cell_types = (
-        torch.unique(cell_type_idx) if cell_type_idx is not None
-        else [None]  # single "all" bucket
+    n_batch_codes = int(batch_idx.max().item()) + 1 if batch_idx.numel() else 1
+    group_key = type_idx * n_batch_codes + batch_idx
+    unique_group_keys, group_idx = torch.unique(group_key, return_inverse=True)
+    n_groups = unique_group_keys.numel()
+
+    group_counts = torch.bincount(group_idx, minlength=n_groups).to(dtype=x.dtype)
+    group_sums = torch.zeros(
+        n_groups, x.shape[1], dtype=x.dtype, device=x.device
+    )
+    group_sums.index_add_(0, group_idx, x)
+    group_sq_sums = torch.zeros(n_groups, dtype=x.dtype, device=x.device)
+    group_sq_sums.index_add_(0, group_idx, (x * x).sum(dim=1))
+
+    # Map existing groups to compact cell-type indices.
+    group_types = unique_group_keys // n_batch_codes
+    unique_types, group_type_idx = torch.unique(
+        group_types, return_inverse=True
+    )
+    n_types = unique_types.numel()
+
+    type_counts = torch.zeros(n_types, dtype=x.dtype, device=x.device)
+    type_counts.index_add_(0, group_type_idx, group_counts)
+    type_sums = torch.zeros(
+        n_types, x.shape[1], dtype=x.dtype, device=x.device
+    )
+    type_sums.index_add_(0, group_type_idx, group_sums)
+
+    # Sum over group-specific quantities required by the identity.
+    type_count_sq_sums = torch.zeros(n_types, dtype=x.dtype, device=x.device)
+    type_count_sq_sums.index_add_(
+        0, group_type_idx, group_counts * group_sq_sums
+    )
+    type_group_norm_sums = torch.zeros(n_types, dtype=x.dtype, device=x.device)
+    type_group_norm_sums.index_add_(
+        0, group_type_idx, (group_sums * group_sums).sum(dim=1)
     )
 
-    for ct in cell_types:
-        if ct is not None:
-            ct_mask = cell_type_idx == ct
-            if not ct_mask.any():
-                continue
-            ct_batch = batch_idx[ct_mask]
-            ct_x = x[ct_mask]
-        else:
-            ct_batch = batch_idx
-            ct_x = x
+    # For each cell type, sum_{different batches} ||x_i - x_j||^2.
+    # This is the unordered-pair form of the pairwise-distance identity.
+    type_sq_sums = torch.zeros(n_types, dtype=x.dtype, device=x.device)
+    type_sq_sums.index_add_(0, group_type_idx, group_sq_sums)
+    type_total_sq = (
+        type_counts * type_sq_sums
+        - type_count_sq_sums
+        - (type_sums * type_sums).sum(dim=1)
+        + type_group_norm_sums
+    )
 
-        unique_batches = torch.unique(ct_batch)
-        if unique_batches.numel() < 2:
-            continue
-
-        # Map cell-type-local batch labels to compact 0..k-1 indices so the
-        # pair counting below stays correct inside each cell type.
-        batch_to_local = {int(b): i for i, b in enumerate(unique_batches)}
-        local_idx = torch.tensor(
-            [batch_to_local[int(b)] for b in ct_batch.tolist()],
-            dtype=torch.long,
-            device=ct_batch.device,
+    type_pair_counts = (
+        type_counts.square()
+        - torch.zeros_like(type_counts).index_add_(
+            0, group_type_idx, group_counts.square()
         )
-        per_local = [ct_x[local_idx == li] for li in range(len(unique_batches))]
-        local_sizes = [t.shape[0] for t in per_local]
-
-        for i in range(len(unique_batches)):
-            for j in range(i + 1, len(unique_batches)):
-                a = per_local[i]
-                b = per_local[j]
-                diff_sq = (a.unsqueeze(1) - b.unsqueeze(0)).pow(2)
-                if reduce == "mean":
-                    diff_sq = diff_sq.mean(dim=-1)
-                else:
-                    diff_sq = diff_sq.sum(dim=-1)
-                pair_sq.append(diff_sq.flatten())
-
-        # Unordered cross-batch pair count inside this cell type
-        local_n = (
-            sum(local_sizes) ** 2
-            - sum(int(s) * int(s) for s in local_sizes)
-        ) // 2
-        n_pairs += int(local_n)
-
-    if n_pairs == 0:
+    ) / 2.0
+    valid = type_pair_counts > 0
+    if not valid.any():
         zero = x.new_zeros(())
         return zero, 0
 
-    all_sq = torch.cat(pair_sq)
-    pair_loss = all_sq.sum() / all_sq.numel()
-    return pair_loss, int(n_pairs)
+    total_sq = type_total_sq[valid].sum()
+    total_pairs = type_pair_counts[valid].sum()
+    if reduce == "mean":
+        total_sq = total_sq / x.shape[1]
+    pair_loss = total_sq / total_pairs
+    return pair_loss, int(total_pairs.item())
 
 
 class VAEWithBatchPairLoss(VAE):

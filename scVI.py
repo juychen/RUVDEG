@@ -87,11 +87,13 @@ TRANSFORM_BATCH = args.transform_batch if USE_BATCH else None
 # Strip the extension so all outputs share one base path: <base>.<suffix>
 OUTBASE = os.path.splitext(OUTPREFIX)[0]
 OUTDIR = os.path.dirname(OUTBASE) or "."
+MODEL_DIR = OUTBASE + ".model"
 os.makedirs(OUTDIR, exist_ok=True)
 
 print(f"input h5ad : {INPUT_H5AD}")
 print(f"out prefix : {OUTPREFIX}")
 print(f"out base   : {OUTBASE}")
+print(f"model dir  : {MODEL_DIR}")
 print(f"transform  : {TRANSFORM_BATCH}  |  n_latent={N_LATENT}  n_layers={N_LAYERS}"
       f"  |  use_batch={USE_BATCH}  use_cont_cov={USE_CONT_COVS}")
 
@@ -207,6 +209,8 @@ else:
 # %%
 model = scvi.model.SCVI(adata_subset, n_layers=N_LAYERS, n_latent=N_LATENT, gene_likelihood="zinb")
 model.train(accelerator=TRAIN_ACCELERATOR, devices=TRAIN_DEVICES)
+model.save(MODEL_DIR, overwrite=True, save_anndata=False)
+print(f"✓ saved model: {MODEL_DIR}")
 
 
 # %%
