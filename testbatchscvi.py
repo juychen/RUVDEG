@@ -44,7 +44,7 @@ adata = sc.read_h5ad(
 
 adata_subset = adata[
     adata.obs["celltype.L2"].isin(
-        adata.obs["celltype.L2"].value_counts().head(2).index[1:2]
+        adata.obs["celltype.L2"].value_counts().head(3).index[1:3]
     )
 ]
 adata_subset = adata_subset[adata_subset.obs["sex"] == "M"]

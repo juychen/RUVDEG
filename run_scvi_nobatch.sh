@@ -17,8 +17,8 @@ TRANSFORM_BATCH="beirui"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
 mkdir -p "$OUT_DIR"
-#ALL_REGIONS=(iCTX TH STR PFC MB HY HPF AMY)
-ALL_REGIONS=(iCTX)
+ALL_REGIONS=(iCTX TH STR PFC MB HY HPF AMY)
+#ALL_REGIONS=(iCTX)
 
 # ---- Optional conda env ----
 # Hardcoded source line removed: activation is handled here so the script
