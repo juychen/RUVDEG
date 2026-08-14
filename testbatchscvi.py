@@ -114,9 +114,9 @@ np.random.seed(seed)
 
 SCVIWithBatchPairLoss.setup_anndata(
     adata_scvi,
-    pair_batch_obs_key="company",  # copied to `_pair_batch` and registered as cat cov
-    batch_key=None,                # SCVI does NOT apply batch-correction at all
-    labels_key=None,
+    pair_batch_obs_key="company",      # copied to `_pair_batch` and registered as cat cov
+    batch_key=None,                    # SCVI does NOT apply batch-correction at all
+    labels_key="celltype.L2",          # restrict cross-batch pairing to within the same cell type
     continuous_covariate_keys=["n_genes_on"],  # pair-batch run uses no continuous covariates
 )
 

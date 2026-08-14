@@ -63,13 +63,16 @@ PAIR_BATCH_KEY = "_pair_batch"
 def _cross_batch_pair_mse(
     x: torch.Tensor,
     batch_idx: torch.Tensor,
+    cell_type_idx: torch.Tensor | None = None,
     reduce: str = "mean",
 ) -> tuple[torch.Tensor, int]:
     """Mean squared difference between cells from *different* batches.
 
-    Builds the Cartesian product across distinct batch groups within ``x``
-    and keeps only pairs where ``batch_idx[i] < batch_idx[j]`` so each
-    unordered pair is counted once.
+    By default, pairs are taken across the full mini-batch (any two cells
+    with different batch indices). If ``cell_type_idx`` is provided, pairs
+    are restricted to cells of the **same** cell type -- this avoids pulling
+    excitatory/inhibitory cell profiles of different batches together when
+    cell-type composition is batch-confounded.
 
     Parameters
     ----------
@@ -78,48 +81,90 @@ def _cross_batch_pair_mse(
         align (e.g. decoder rate ``mu`` or latent ``z``).
     batch_idx
         Long tensor of shape ``(n_obs,)`` -- batch index of each cell.
+    cell_type_idx
+        Optional long tensor of shape ``(n_obs,)`` -- cell-type index of
+        each cell. If ``None``, behaves as the original cross-batch version.
     reduce
         ``"mean"`` or ``"sum"`` reduction over features within each pair.
 
     Returns
     -------
     pair_loss
-    Scalar tensor (requires grad): mean over cell pairs of the summed
-    squared feature differences. Returns ``0`` when the mini-batch
-    contains fewer than two batches.
+        Scalar tensor (requires grad): mean over cell pairs of the summed
+        squared feature differences. Returns ``0`` when the mini-batch
+        contains fewer than two batches (within a cell type when filtered).
     n_pairs
         Number of unordered cell-cell pairs used (= 0 when degenerate).
     """
     if reduce not in {"mean", "sum"}:
         raise ValueError(f"reduce must be 'mean' or 'sum', got {reduce!r}")
 
-    unique_batches = torch.unique(batch_idx)
-    if unique_batches.numel() < 2:
+    if cell_type_idx is not None:
+        if cell_type_idx.shape != batch_idx.shape:
+            raise ValueError(
+                "cell_type_idx must have the same shape as batch_idx; "
+                f"got {tuple(cell_type_idx.shape)} vs {tuple(batch_idx.shape)}"
+            )
+
+    pair_sq = []
+    n_pairs = 0
+
+    # ---- (a) Iterate over cell types when cell_type_idx is given ----
+    cell_types = (
+        torch.unique(cell_type_idx) if cell_type_idx is not None
+        else [None]  # single "all" bucket
+    )
+
+    for ct in cell_types:
+        if ct is not None:
+            ct_mask = cell_type_idx == ct
+            if not ct_mask.any():
+                continue
+            ct_batch = batch_idx[ct_mask]
+            ct_x = x[ct_mask]
+        else:
+            ct_batch = batch_idx
+            ct_x = x
+
+        unique_batches = torch.unique(ct_batch)
+        if unique_batches.numel() < 2:
+            continue
+
+        # Map cell-type-local batch labels to compact 0..k-1 indices so the
+        # pair counting below stays correct inside each cell type.
+        batch_to_local = {int(b): i for i, b in enumerate(unique_batches)}
+        local_idx = torch.tensor(
+            [batch_to_local[int(b)] for b in ct_batch.tolist()],
+            dtype=torch.long,
+            device=ct_batch.device,
+        )
+        per_local = [ct_x[local_idx == li] for li in range(len(unique_batches))]
+        local_sizes = [t.shape[0] for t in per_local]
+
+        for i in range(len(unique_batches)):
+            for j in range(i + 1, len(unique_batches)):
+                a = per_local[i]
+                b = per_local[j]
+                diff_sq = (a.unsqueeze(1) - b.unsqueeze(0)).pow(2)
+                if reduce == "mean":
+                    diff_sq = diff_sq.mean(dim=-1)
+                else:
+                    diff_sq = diff_sq.sum(dim=-1)
+                pair_sq.append(diff_sq.flatten())
+
+        # Unordered cross-batch pair count inside this cell type
+        local_n = (
+            sum(local_sizes) ** 2
+            - sum(int(s) * int(s) for s in local_sizes)
+        ) // 2
+        n_pairs += int(local_n)
+
+    if n_pairs == 0:
         zero = x.new_zeros(())
         return zero, 0
 
-    # Slice x by batch index into a Python list of (n_b, F) tensors.
-    per_batch = [x[batch_idx == b] for b in unique_batches]
-    sizes = [t.shape[0] for t in per_batch]
-
-    pair_sq = []
-    for i in range(len(unique_batches)):
-        for j in range(i + 1, len(unique_batches)):
-            a = per_batch[i]                     # (n_i, F)
-            b = per_batch[j]                     # (n_j, F)
-            # Broadcasting → (n_i, n_j, F); per-feature squared diff
-            diff_sq = (a.unsqueeze(1) - b.unsqueeze(0)).pow(2)
-            if reduce == "mean":
-                diff_sq = diff_sq.mean(dim=-1)   # (n_i, n_j)
-            else:
-                diff_sq = diff_sq.sum(dim=-1)    # (n_i, n_j)
-            pair_sq.append(diff_sq.flatten())
-
     all_sq = torch.cat(pair_sq)
-    # Mean over all (cell_pair × feature) entries → one scalar.
     pair_loss = all_sq.sum() / all_sq.numel()
-
-    n_pairs = (sum(sizes) ** 2 - sum(int(s) * int(s) for s in sizes)) // 2
     return pair_loss, int(n_pairs)
 
 
@@ -186,7 +231,18 @@ class VAEWithBatchPairLoss(VAE):
             batch_idx = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
         else:
             batch_idx = cat_covs.long().view(-1)
-        pair_loss, n_pairs = _cross_batch_pair_mse(x, batch_idx, reduce=reduce)
+
+        # Optional cell-type mask: restrict cross-batch pairing to within
+        # the same cell type so different cell types never get pulled
+        # together. Cell type comes from the labels registry
+        # (REGISTRY_KEYS.LABELS_KEY, "labels" key).
+        cell_type_idx = tensors.get(REGISTRY_KEYS.LABELS_KEY, None)
+        if cell_type_idx is not None:
+            cell_type_idx = cell_type_idx.long().view(-1)
+
+        pair_loss, n_pairs = _cross_batch_pair_mse(
+            x, batch_idx, cell_type_idx=cell_type_idx, reduce=reduce
+        )
 
         # ---- Combine with scVI loss ----
         if n_pairs > 0:
