@@ -18,6 +18,26 @@
 import scanpy as sc
 from pathlib import Path
 
+
+def to_sparse_int(arr):
+    """把 numpy / float / 稀疏数组转换成 (n_cells, n_genes) 的 csr int 矩阵。
+
+    - 输入若为稀疏矩阵：保持格式，只把 dtype 转成 int32。
+    - 输入若为稠密 ndarray：rint 截断后构造 csr（counts 必须是离散整数）。
+    - 用于把 decoder 抽样得到的 counts 写入 adata.layers["..."]，避免 h5ad
+      把 float 数组按 ~8 字节/元素存储（counts 通常很稀疏 + 数值小）。
+    """
+    import numpy as np
+    from scipy.sparse import csr_matrix, issparse
+    if issparse(arr):
+        return csr_matrix(arr).astype(np.int32)
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        # 防御性：误传 1D 时强制 reshape 成单行矩阵
+        arr = arr.reshape(1, -1)
+    return csr_matrix(np.rint(arr).astype(np.int32))
+
+
 adata = sc.read_h5ad(
     "/data7/mark/STG/dataset/snRNA/merge_SCH_new/six_datasets_4v3_500_1000gene/TH_downsampled_ratio.h5ad"
 )
@@ -432,4 +452,170 @@ print(f"Pair weight: {PAIR_WEIGHT}, align_on: {ALIGN_ON}")
 print(f"mu-MSE baseline={float(loss_plain):.4f}  pair={float(loss_pair):.4f}")
 print("✓ Inherited SCVI training pipeline + cross-batch pair-MSE term")
 
+
+n_samples = 1   # 每细胞 1 个 reconstruction sample
+reconstructed = model.posterior_predictive_sample(
+    adata=adata_scvi,
+    n_samples=n_samples,
+    batch_size=512,
+    silent=False,
+)
+# 返回 shape: (n_samples, n_cells, n_genes) → squeeze 到 (n_cells, n_genes)
+reconstructed = np.asarray(reconstructed.todense())
+
+print(f"reconstructed shape: {reconstructed.shape}  dtype={reconstructed.dtype}")
+print(f"range: [{reconstructed.min()}, {reconstructed.max()}]  median={np.median(reconstructed):.2f}")
+print(f"fraction non-zero: {(reconstructed > 0).mean():.3f}")
+
+# 3) 写回 adata —— 稀疏 int 矩阵，节省 h5ad 存储
+adata_scvi.layers["batchpair_counts"] = to_sparse_int(reconstructed)
+
+
+# %%
+# ========== Native SCVI reconstruction with company transformed to beirui ==========
+# ``m_plain`` was trained with batch_key="company". Keeping each cell's
+# latent biology but decoding every cell under the same company condition
+# gives the native scVI batch-corrected posterior-predictive counts.
+SCVI_TRANSFORM_BATCH = "beirui"
+available_companies = adata_scvi.obs["company"].astype(str).unique().tolist()
+if SCVI_TRANSFORM_BATCH not in available_companies:
+    raise ValueError(
+        f"SCVI_TRANSFORM_BATCH={SCVI_TRANSFORM_BATCH!r} is not present in "
+        f"company values: {available_companies}"
+    )
+
+scvi_reconstructed = m_plain.posterior_predictive_sample(
+    adata=adata_scvi,
+    n_samples=1,
+    batch_size=512,
+    transform_batch=[SCVI_TRANSFORM_BATCH],
+    silent=False,
+)
+
+if hasattr(scvi_reconstructed, "todense"):
+    scvi_reconstructed = np.asarray(scvi_reconstructed.todense())
+else:
+    scvi_reconstructed = np.asarray(scvi_reconstructed)
+
+# scVI may return (n_samples, n_cells, n_genes) or (n_cells, n_genes).
+if scvi_reconstructed.ndim == 3 and scvi_reconstructed.shape[0] == 1:
+    scvi_reconstructed = scvi_reconstructed[0]
+
+print(f"native SCVI transformed batch: {SCVI_TRANSFORM_BATCH}")
+print(f"reconstructed shape: {scvi_reconstructed.shape}  dtype={scvi_reconstructed.dtype}")
+print(
+    f"range: [{scvi_reconstructed.min()}, {scvi_reconstructed.max()}] "
+    f"median={np.median(scvi_reconstructed):.2f}"
+)
+print(f"fraction non-zero: {(scvi_reconstructed > 0).mean():.3f}")
+
+adata_scvi.layers["scvi_beirui_counts"] = to_sparse_int(scvi_reconstructed)
+
+
+# %%
+# ========== Decode pair-model embeddings with the native SCVI decoder ==========
+# This intentionally does NOT use transform_batch. The pair-model latent
+# embedding is injected into the native SCVI decoder, while each cell keeps
+# its original company index and library size from the plain SCVI model.
+from scvi.module._constants import MODULE_KEYS
+
+z_pair = model.get_latent_representation(
+    adata=adata_scvi,
+    batch_size=512,
+)
+
+plain_decoder_means = []
+m_plain.module.eval()
+with torch.no_grad():
+    plain_loader = m_plain._make_data_loader(
+        adata=adata_scvi,
+        indices=np.arange(adata_scvi.n_obs),
+        batch_size=512,
+        shuffle=False,
+    )
+    cell_start = 0
+    for tensors in plain_loader:
+        plain_inference_inputs = m_plain.module._get_inference_input(tensors)
+        plain_inference = m_plain.module.inference(**plain_inference_inputs)
+        plain_generative_inputs = m_plain.module._get_generative_input(
+            tensors,
+            plain_inference,
+        )
+
+        cell_stop = cell_start + tensors["X"].shape[0]
+        plain_generative_inputs[MODULE_KEYS.Z_KEY] = torch.as_tensor(
+            z_pair[cell_start:cell_stop],
+            dtype=plain_inference[MODULE_KEYS.Z_KEY].dtype,
+            device=plain_inference[MODULE_KEYS.Z_KEY].device,
+        )
+        plain_decoder_outputs = m_plain.module.generative(
+            **plain_generative_inputs,
+        )
+        plain_decoder_means.append(
+            plain_decoder_outputs[MODULE_KEYS.PX_KEY].mu.detach().cpu()
+        )
+        cell_start = cell_stop
+
+plain_decoder_pair_embedding = torch.cat(plain_decoder_means, dim=0).numpy()
+print(
+    "native SCVI decoder + pair embedding shape:",
+    plain_decoder_pair_embedding.shape,
+)
+print(
+    "native SCVI decoder + pair embedding range:",
+    f"[{plain_decoder_pair_embedding.min():.2f}, "
+    f"{plain_decoder_pair_embedding.max():.2f}]",
+)
+
+adata_scvi.layers["scvi_decoder_pair_embedding_counts"] = to_sparse_int(
+    plain_decoder_pair_embedding
+)
+
+
+hkg_priority = [
+    "Aars", "Sars", "Polr2a", "Polr2f", "Psmd6", "Psmd7", "Psma5",
+    "Rer1", "Ipo8", "Pop4", "Pes1", "Oaz1", "Rpl13a", "Rpl27",
+    "Rps13", "Rps20", "Hprt1", "Gusb", "Ppia", "Ywhaz", "Cyc1",
+    "Sdha", "Ubc",
+]
+
+# Keep only housekeeping genes available in this AnnData object and preserve
+# the curated order so both methods use exactly the same y-axis genes.
+hkg_genes = []
+seen_genes = set()
+for gene in hkg_priority:
+    if gene in adata_scvi.var_names and gene not in seen_genes:
+        hkg_genes.append(gene)
+        seen_genes.add(gene)
+
+print(f"HKG genes available: {len(hkg_genes)} / {len(hkg_priority)}")
+if len(hkg_genes) < 2:
+    print("[warn] Skip HKG dotplots: fewer than 2 HKG genes are present")
+else:
+    # Since this test subset contains CON cells only, company is the useful
+    # comparison axis for these two corrected expression layers.
+    for layer_name, file_stem, title in [
+        ("batchpair_counts", "hkg_dotplot_batchpair", "Pair-MSE model"),
+        ("scvi_beirui_counts", "hkg_dotplot_scvi_beirui", "Native SCVI -> beirui"),
+        (
+            "scvi_decoder_pair_embedding_counts",
+            "hkg_dotplot_scvi_decoder_pair_embedding",
+            "Native SCVI decoder <- pair embedding",
+        ),
+        ("counts", "hkg_dotplot_raw", "raw counts"),
+    ]:
+        fig = sc.pl.dotplot(
+            adata_scvi,
+            var_names=hkg_genes,
+            groupby="sample",
+            layer=layer_name,
+            swap_axes=False,
+            dendrogram=False,
+            return_fig=True,
+            vmax=1,
+            show=False,
+        )
+        fig_out = SLIDE_FIG_DIR / f"{file_stem}.count.png"
+        fig.savefig(fig_out, bbox_inches="tight", dpi=200)
+        print(f"✓ saved: {fig_out}")
 
