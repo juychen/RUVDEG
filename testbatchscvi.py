@@ -114,9 +114,9 @@ np.random.seed(seed)
 
 SCVIWithBatchPairLoss.setup_anndata(
     adata_scvi,
-    pair_batch_obs_key="company",      # copied to `_pair_batch` and registered as cat cov
-    batch_key=None,                    # SCVI does NOT apply batch-correction at all
-    labels_key="celltype.L2",          # restrict cross-batch pairing to within the same cell type
+    pair_batch_obs_key="company",  # copied to `_pair_batch` and registered as cat cov
+    batch_key=None,                # SCVI does NOT apply batch-correction at all
+    labels_key=None,
     continuous_covariate_keys=["n_genes_on"],  # pair-batch run uses no continuous covariates
 )
 
@@ -248,8 +248,8 @@ model.train(
     max_epochs=100,
     train_size=0.9,
     batch_size=256,
-    early_stopping=True,
-    early_stopping_patience=5,
+    # early_stopping=True,
+    # early_stopping_patience=5,
     plan_kwargs={"lr": 1e-3},
 )
 print("✓ training complete")
