@@ -124,7 +124,7 @@ SCVIWithBatchPairLoss.setup_anndata(
     adata_scvi,
     pair_batch_obs_key="company",  # copied to `_pair_batch` and registered as cat cov
     batch_key=None,                # SCVI does NOT apply batch-correction at all
-    labels_key=None,
+    labels_key="celltype.L2",
     continuous_covariate_keys=["n_genes_on"],  # pair-batch run uses no continuous covariates
 )
 
@@ -509,6 +509,26 @@ print(f"fraction non-zero: {(scvi_reconstructed > 0).mean():.3f}")
 
 adata_scvi.layers["scvi_beirui_counts"] = to_sparse_int(scvi_reconstructed)
 
+# Deterministic native-SCVI normalized expression at a shared library size.
+# This is preferable to posterior-predictive counts for downstream plots.
+SCVI_LIBRARY_SIZE = 1e4
+scvi_beirui_normalized = m_plain.get_normalized_expression(
+    adata=adata_scvi,
+    transform_batch=[SCVI_TRANSFORM_BATCH],
+    library_size=SCVI_LIBRARY_SIZE,
+    batch_size=512,
+    return_numpy=True,
+)
+scvi_beirui_normalized = np.asarray(scvi_beirui_normalized, dtype=np.float32)
+adata_scvi.layers["scvi_beirui_normalized"] = csr_matrix(
+    scvi_beirui_normalized
+)
+print(
+    "native SCVI normalized layer:",
+    scvi_beirui_normalized.shape,
+    f"library_size={SCVI_LIBRARY_SIZE:g}",
+)
+
 
 # %%
 # ========== Decode pair-model embeddings with the native SCVI decoder ==========
@@ -568,6 +588,55 @@ adata_scvi.layers["scvi_decoder_pair_embedding_counts"] = to_sparse_int(
 )
 
 
+# ========== Pair-model normalized expression with a shared library size ==========
+# Decode the pair model's own aligned latent means with its own decoder.
+# Unlike posterior_predictive_sample, this is deterministic and does not use
+# each cell's original library size.
+pair_decoder_means = []
+model.module.eval()
+with torch.no_grad():
+    pair_loader = model._make_data_loader(
+        adata=adata_scvi,
+        indices=np.arange(adata_scvi.n_obs),
+        batch_size=512,
+        shuffle=False,
+    )
+    cell_start = 0
+    for tensors in pair_loader:
+        inference_inputs = model.module._get_inference_input(tensors)
+        inference_outputs = model.module.inference(**inference_inputs)
+        generative_inputs = model.module._get_generative_input(
+            tensors,
+            inference_outputs,
+        )
+
+        cell_stop = cell_start + tensors["X"].shape[0]
+        generative_inputs[MODULE_KEYS.Z_KEY] = torch.as_tensor(
+            z_pair[cell_start:cell_stop],
+            dtype=inference_outputs[MODULE_KEYS.Z_KEY].dtype,
+            device=inference_outputs[MODULE_KEYS.Z_KEY].device,
+        )
+        generative_inputs[MODULE_KEYS.LIBRARY_KEY] = torch.full_like(
+            generative_inputs[MODULE_KEYS.LIBRARY_KEY],
+            np.log(SCVI_LIBRARY_SIZE),
+        )
+        generated = model.module.generative(**generative_inputs)
+        pair_decoder_means.append(
+            generated[MODULE_KEYS.PX_KEY].mu.detach().cpu()
+        )
+        cell_start = cell_stop
+
+batchpair_normalized = torch.cat(pair_decoder_means, dim=0).numpy().astype(
+    np.float32
+)
+adata_scvi.layers["batchpair_normalized"] = csr_matrix(batchpair_normalized)
+print(
+    "pair model normalized layer:",
+    batchpair_normalized.shape,
+    f"library_size={SCVI_LIBRARY_SIZE:g}",
+)
+
+
 hkg_priority = [
     "Aars", "Sars", "Polr2a", "Polr2f", "Psmd6", "Psmd7", "Psma5",
     "Rer1", "Ipo8", "Pop4", "Pes1", "Oaz1", "Rpl13a", "Rpl27",
@@ -597,6 +666,16 @@ else:
             "scvi_decoder_pair_embedding_counts",
             "hkg_dotplot_scvi_decoder_pair_embedding",
             "Native SCVI decoder <- pair embedding",
+        ),
+        (
+            "batchpair_normalized",
+            "hkg_dotplot_batchpair_normalized",
+            "Pair-MSE normalized",
+        ),
+        (
+            "scvi_beirui_normalized",
+            "hkg_dotplot_scvi_beirui_normalized",
+            "Native SCVI -> beirui normalized",
         ),
         ("counts", "hkg_dotplot_raw", "raw counts"),
     ]:
