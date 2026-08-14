@@ -17,6 +17,25 @@
 # ========== Load the same data subset as testRUVVAE_ZINB.ipynb ==========
 import scanpy as sc
 from pathlib import Path
+import sys
+sys.path.insert(0, "/home/junyichen/code/RUVAEDEG")
+
+import numpy as np
+import pandas as pd
+import torch
+from scipy.sparse import csr_matrix, issparse
+from torch.utils.data import Sampler
+import matplotlib.pyplot as plt
+import scanpy.external as sce
+from sklearn.metrics import silhouette_score
+from scvi.model import SCVI as _SCVI
+
+from model_scvi_batch_pair import (
+    SCVIWithBatchPairLoss,
+    VAEWithBatchPairLoss,
+    _cross_batch_pair_mse,
+)
+from scvi.module._constants import MODULE_KEYS
 
 
 def to_sparse_int(arr):
@@ -27,8 +46,6 @@ def to_sparse_int(arr):
     - 用于把 decoder 抽样得到的 counts 写入 adata.layers["..."]，避免 h5ad
       把 float 数组按 ~8 字节/元素存储（counts 通常很稀疏 + 数值小）。
     """
-    import numpy as np
-    from scipy.sparse import csr_matrix, issparse
     if issparse(arr):
         return csr_matrix(arr).astype(np.int32)
     arr = np.asarray(arr)
@@ -60,13 +77,6 @@ print(f"company counts:\n{adata_subset.obs['company'].value_counts()}")
 
 # %%
 # ========== Prepare scVI-format data: raw counts in X + n_genes_on covariate ==========
-import sys
-sys.path.insert(0, "/home/junyichen/code/RUVAEDEG")
-import numpy as np
-import pandas as pd
-import torch
-from scipy.sparse import csr_matrix
-
 adata_scvi = adata_subset.copy()
 
 # counts → X
@@ -106,8 +116,6 @@ print("n_genes_on dtype   :", adata_scvi.obs["n_genes_on"].dtype)
 
 # %%
 # ========== Import the new model and run setup_anndata + instantiation ==========
-from model_scvi_batch_pair import SCVIWithBatchPairLoss, VAEWithBatchPairLoss
-
 seed = 42
 torch.manual_seed(seed)
 np.random.seed(seed)
@@ -146,8 +154,6 @@ print(f"n_batch:       {model.module.n_batch}")
 
 # %%
 # ========== StratifiedBatchSampler: guarantee every mini-batch spans all batches ==========
-from torch.utils.data import Sampler
-
 class StratifiedBatchSampler(Sampler):
     """Within each mini-batch draw (roughly) the same number of cells from
     every ``batch_key`` category. Guarantees every mini-batch spans >=2
@@ -271,7 +277,6 @@ for k in metric_keys:
     if "batch_pair_mse" in k:
         pair_mse_per_epoch = np.asarray(history[k], dtype=float)
 
-import matplotlib.pyplot as plt
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 axes[0].plot(elbo,  label="ELBO (train)")
 axes[0].plot(recon, label="reconstruction_loss_train")
@@ -320,7 +325,6 @@ plt.close(umap_fig)
 
 # %%
 # ========== iLISI + silhouette: how well are batches mixed? ==========
-import scanpy.external as sce
 try:
     sce.pp.lisi_knn(
         adata_scvi,
@@ -335,7 +339,6 @@ try:
 except Exception as exc:
     print(f"[warn] scanpy.external unavailable: {exc}")
 
-from sklearn.metrics import silhouette_score
 asw_batch = silhouette_score(adata_scvi.obsm["X_scVI_pair"], adata_scvi.obs["company"])
 status_labels = adata_scvi.obs["status"].astype(str)
 if status_labels.nunique() >= 2:
@@ -349,8 +352,6 @@ print(f"ASW (status,  ↑): {asw_bio:.4f}" if np.isfinite(asw_bio)
 
 # %%
 # ========== Compare to plain SCVI (no pair loss) ==========
-from scvi.model import SCVI as _SCVI
-
 _SCVI.setup_anndata(
     adata_scvi,
     batch_key="company",
@@ -421,9 +422,6 @@ print(summary.to_string(index=False))
 
 # %%
 # ========== Compare baseline SCVI vs pair model: per-pair cross-batch MSE on mu ==========
-import torch
-from model_scvi_batch_pair import _cross_batch_pair_mse
-
 def _per_cell_mu(model_obj):
     out = []
     scdl = model_obj._make_data_loader(adata=adata_scvi, batch_size=512)
@@ -517,8 +515,6 @@ adata_scvi.layers["scvi_beirui_counts"] = to_sparse_int(scvi_reconstructed)
 # This intentionally does NOT use transform_batch. The pair-model latent
 # embedding is injected into the native SCVI decoder, while each cell keeps
 # its original company index and library size from the plain SCVI model.
-from scvi.module._constants import MODULE_KEYS
-
 z_pair = model.get_latent_representation(
     adata=adata_scvi,
     batch_size=512,
