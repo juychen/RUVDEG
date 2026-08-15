@@ -679,6 +679,10 @@ else:
         ),
         ("counts", "hkg_dotplot_raw", "raw counts"),
     ]:
+        f_vmax = 1
+        if "normalized" in layer_name:
+            f_vmax = None
+
         fig = sc.pl.dotplot(
             adata_scvi,
             var_names=hkg_genes,
@@ -687,7 +691,7 @@ else:
             swap_axes=False,
             dendrogram=False,
             return_fig=True,
-            vmax=1,
+            vmax=f_vmax,
             show=False,
         )
         fig_out = SLIDE_FIG_DIR / f"{file_stem}.count.png"
