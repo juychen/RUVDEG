@@ -60,9 +60,10 @@ adata = sc.read_h5ad(
     "/data7/mark/STG/dataset/snRNA/merge_SCH_new/six_datasets_4v3_500_1000gene/TH_downsampled_ratio.h5ad"
 )
 
+N_CT = 5
 adata_subset = adata[
     adata.obs["celltype.L2"].isin(
-        adata.obs["celltype.L2"].value_counts().head(3).index[1:3]
+        adata.obs["celltype.L2"].value_counts().head(N_CT).index[1:N_CT]
     )
 ]
 adata_subset = adata_subset[adata_subset.obs["sex"] == "M"]
@@ -314,7 +315,7 @@ sc.pp.neighbors(adata_scvi, use_rep="X_scVI_pair")
 sc.tl.umap(adata_scvi)
 umap_fig = sc.pl.umap(
     adata_scvi,
-    color=["company", "status"],
+    color=["company", "celltype.L2"],
     ncols=2,
     title=["UMAP by company (batch)", "UMAP by status (bio)"],
     show=False,

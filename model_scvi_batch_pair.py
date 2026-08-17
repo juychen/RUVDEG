@@ -45,7 +45,9 @@ used to compute the cross-batch pair-MSE loss.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
+from torch.utils.data import Sampler
 
 from scvi import REGISTRY_KEYS
 from scvi.model import SCVI
@@ -58,6 +60,156 @@ from scvi.module.base import LossOutput
 # ``REGISTRY_KEYS.CAT_COVS_KEY`` ("extra_categorical_covs"), NOT under this
 # name, because scVI routes categorical covariates through its registry.
 PAIR_BATCH_KEY = "_pair_batch"
+
+
+class CelltypeBatchStratifiedSampler(Sampler):
+    """按 (celltype × batch) 分层采样：每个 mini-batch 都覆盖所有有效组。
+
+    每个 mini-batch 都从 **每个 (celltype, batch) 组** 取 ``per_group_quota``
+    个样本,这样::
+
+        per_group_quota = max(1, batch_size // n_groups)
+        mini-batch size = n_groups * per_group_quota
+
+    由于一个 mini-batch 必然同时包含同一 celltype 的多个 batch,
+    ``_cross_batch_pair_mse(..., cell_type_idx=...)`` 在该 celltype 上必有
+    cross-batch unordered pair, gradient 永远有信号。
+
+    Notes
+    -----
+    * 仅保留 **每个 celltype 至少出现在 2 个 batch** 的组;否则该 celltype
+      无法产生 cross-batch pair,采样会浪费。
+    * 每个 group 的 cell数 至少需要 ``per_group_quota``;否则该 group 被丢弃
+      且 batch_size 实际生效值变小。
+    * 每个 epoch 严格迭代 ``num_iter = min(|group| // quota)`` 次,剩余细胞
+      被丢弃(可接受:保证 mini-batch 形状一致)。
+
+    Parameters
+    ----------
+    celltype_codes
+        Long array (n_obs,) of integer celltype ids.
+    batch_codes
+        Long array (n_obs,) of integer batch ids.
+    batch_size
+        Target mini-batch size; ``per_group_quota = max(1, batch_size // n_groups)``.
+    seed
+        Random seed for shuffling within each group.
+    min_cells_per_group
+        Drop any (celltype, batch) group with fewer than this many cells.
+    """
+
+    def __init__(
+        self,
+        celltype_codes: np.ndarray,
+        batch_codes: np.ndarray,
+        batch_size: int,
+        seed: int = 0,
+        min_cells_per_group: int = 2,
+    ):
+        celltype_codes = np.asarray(celltype_codes)
+        batch_codes = np.asarray(batch_codes)
+        if celltype_codes.shape != batch_codes.shape:
+            raise ValueError(
+                "celltype_codes and batch_codes must have the same shape; "
+                f"got {tuple(celltype_codes.shape)} vs {tuple(batch_codes.shape)}"
+            )
+
+        self.celltype_codes = celltype_codes
+        self.batch_codes = batch_codes
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        # Encode each (celltype, batch) pair as one integer so we can group by it.
+        n_batch_codes = (
+            int(batch_codes.max()) + 1 if batch_codes.size else 1
+        )
+        self._n_batch_codes = n_batch_codes
+        group_key = celltype_codes * n_batch_codes + batch_codes
+        unique_keys, inverse = np.unique(group_key, return_inverse=True)
+        self._unique_keys = unique_keys
+
+        # Drop groups that are too small.
+        group_indices_all: dict[int, np.ndarray] = {}
+        for g in range(len(unique_keys)):
+            idx = np.where(inverse == g)[0]
+            if len(idx) >= int(min_cells_per_group):
+                group_indices_all[g] = idx
+
+        if not group_indices_all:
+            raise ValueError(
+                f"没有任何 (celltype × batch) 组有 ≥ {min_cells_per_group} 个细胞；"
+                "请检查 celltype / batch 标签是否有 NaN 或过小的类别。"
+            )
+
+        # Keep only celltypes that span ≥ 2 batches (else they cannot produce
+        # a cross-batch pair and would only contribute noise).
+        celltype_to_batches: dict[int, set[int]] = {}
+        for g in group_indices_all:
+            key = unique_keys[g]
+            ct = int(key // n_batch_codes)
+            b = int(key % n_batch_codes)
+            celltype_to_batches.setdefault(ct, set()).add(b)
+
+        valid_groups: dict[int, np.ndarray] = {}
+        for g, idx in group_indices_all.items():
+            ct = int(unique_keys[g] // n_batch_codes)
+            if len(celltype_to_batches[ct]) >= 2:
+                valid_groups[g] = idx
+
+        if not valid_groups:
+            raise ValueError(
+                "没有 celltype 同时出现在 ≥ 2 个 batch；"
+                "无法构造 cross-batch pair。"
+            )
+
+        self.group_indices = valid_groups
+        self.n_groups = len(valid_groups)
+        self.per_group_quota = max(1, self.batch_size // self.n_groups)
+        self.effective_batch_size = self.per_group_quota * self.n_groups
+
+        # Cap each group so every mini-batch has the same shape.
+        self.num_iter = min(
+            len(v) // self.per_group_quota for v in self.group_indices.values()
+        )
+        if self.num_iter == 0:
+            raise ValueError(
+                f"没有 (celltype × batch) 组有 ≥ {self.per_group_quota} 个细胞；"
+                "请减小 --batch-size 或减少 celltype / batch 类别。"
+            )
+        self.group_indices = {
+            g: idx[: self.num_iter * self.per_group_quota].copy()
+            for g, idx in self.group_indices.items()
+        }
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        pools = {
+            g: rng.permutation(idx).tolist()
+            for g, idx in self.group_indices.items()
+        }
+        for it in range(self.num_iter):
+            chunk: list[int] = []
+            for ids in pools.values():
+                chunk.extend(
+                    ids[it * self.per_group_quota : (it + 1) * self.per_group_quota]
+                )
+            rng.shuffle(chunk)
+            yield chunk
+        self.epoch += 1
+
+    def __len__(self) -> int:
+        return self.num_iter
+
+    def group_summary(self) -> list[tuple[int, int, int]]:
+        """Return ``[(celltype_id, batch_id, n_cells), ...]`` for kept groups."""
+        out: list[tuple[int, int, int]] = []
+        for g, idx in self.group_indices.items():
+            key = int(self._unique_keys[g])
+            ct = key // self._n_batch_codes
+            b = key % self._n_batch_codes
+            out.append((int(ct), int(b), int(len(idx))))
+        return out
 
 
 def _cross_batch_pair_mse(
@@ -359,3 +511,135 @@ class SCVIWithBatchPairLoss(SCVI):
             categorical_covariate_keys=cat_covs,
             **kwargs,
         )
+
+
+# =========================================================================
+# Demo / smoke test
+# =========================================================================
+if __name__ == "__main__":
+    """Smoke test for ``CelltypeBatchStratifiedSampler``.
+
+    Build a synthetic dataset with K celltypes × B batches, where every
+    celltype appears in every batch with at least ``quota`` cells, run the
+    sampler, and assert each mini-batch:
+
+      * has the expected size,
+      * contains ≥ 2 distinct batches inside every celltype (so
+        cross-batch same-celltype pairs always exist).
+    """
+    import numpy as np
+    from itertools import combinations
+
+    rng = np.random.default_rng(0)
+
+    # ---- Synthetic dataset -----------------------------------------------
+    N_CELLTYPES = 4
+    N_BATCHES = 3
+    N_CELLS_PER_GROUP = 30          # every (celltype, batch) has 30 cells
+    target_batch_size = 96          # → quota = 96 / 12 = 8 per group
+
+    celltype_codes = np.repeat(
+        np.arange(N_CELLTYPES), N_BATCHES * N_CELLS_PER_GROUP
+    )
+    batch_codes = np.tile(
+        np.repeat(np.arange(N_BATCHES), N_CELLS_PER_GROUP), N_CELLTYPES
+    )
+    perm = rng.permutation(len(celltype_codes))
+    celltype_codes = celltype_codes[perm]
+    batch_codes = batch_codes[perm]
+    n_cells = len(celltype_codes)
+    print(f"=== Synthetic data ===")
+    print(f"  n_cells      = {n_cells}")
+    print(f"  n_celltypes  = {N_CELLTYPES}")
+    print(f"  n_batches    = {N_BATCHES}")
+    print(f"  per-(ct,b)   = {N_CELLS_PER_GROUP}")
+
+    # ---- Construct sampler -----------------------------------------------
+    sampler = CelltypeBatchStratifiedSampler(
+        celltype_codes=celltype_codes,
+        batch_codes=batch_codes,
+        batch_size=target_batch_size,
+        seed=42,
+    )
+    print(f"\n=== Sampler summary ===")
+    print(f"  n_groups               = {sampler.n_groups}")
+    print(f"  per_group_quota        = {sampler.per_group_quota}")
+    print(f"  effective_batch_size   = {sampler.effective_batch_size}")
+    print(f"  num_iter per epoch     = {sampler.num_iter}")
+    print(f"  group (ct, batch, n):")
+    for ct, b, n in sampler.group_summary():
+        print(f"    celltype={ct}  batch={b}  n_cells={n}")
+
+    # ---- Test every mini-batch ------------------------------------------
+    print(f"\n=== Per-mini-batch invariant check ===")
+    n_tested = 0
+    all_pass = True
+    for batch_idx_list in sampler:
+        n_tested += 1
+        if len(batch_idx_list) != sampler.effective_batch_size:
+            print(
+                f"  ✗ mini-batch #{n_tested} has wrong size "
+                f"{len(batch_idx_list)} (expected {sampler.effective_batch_size})"
+            )
+            all_pass = False
+            break
+
+        ct_arr = celltype_codes[batch_idx_list]
+        b_arr = batch_codes[batch_idx_list]
+
+        # For each celltype present in this mini-batch, count distinct batches
+        # and the number of cross-batch unordered pairs.
+        celltypes_with_cross: dict[int, dict[str, int]] = {}
+        for ct_id in np.unique(ct_arr):
+            mask = ct_arr == ct_id
+            b_in_ct = b_arr[mask]
+            n_batches_in_ct = int(len(np.unique(b_in_ct)))
+            n_pairs = sum(
+                1
+                for b1, b2 in combinations(b_in_ct, 2)
+                if b1 != b2
+            )
+            celltypes_with_cross[int(ct_id)] = {
+                "n_cells": int(mask.sum()),
+                "n_batches": n_batches_in_ct,
+                "n_cross_pairs": n_pairs,
+            }
+
+        # The invariant: every celltype in this mini-batch must span ≥ 2 batches
+        # with at least 1 cross-batch pair.
+        bad = [
+            ct
+            for ct, info in celltypes_with_cross.items()
+            if info["n_batches"] < 2 or info["n_cross_pairs"] == 0
+        ]
+        if bad:
+            print(f"  ✗ mini-batch #{n_tested}: celltypes missing cross-batch pair: {bad}")
+            all_pass = False
+
+        if n_tested <= 2 or not all_pass:
+            print(f"  mini-batch #{n_tested}: size={len(batch_idx_list)}")
+            for ct, info in celltypes_with_cross.items():
+                print(
+                    f"    ct={ct}: {info['n_cells']} cells, "
+                    f"{info['n_batches']} batches, "
+                    f"{info['n_cross_pairs']} cross-batch pairs"
+                )
+
+    print(f"\n{'✓ ALL PASS' if all_pass else '✗ SOME FAILED'}: "
+          f"{n_tested} mini-batches tested")
+
+    # ---- ---- Test the "edge case: celltype only in 1 batch" drop path ----
+    print(f"\n=== Edge case: a celltype exists in only 1 batch ===")
+    edge_ct = np.array([0, 0, 0, 1, 1, 1, 1, 1], dtype=int)
+    edge_b = np.array([0, 0, 1, 0, 0, 0, 0, 0], dtype=int)  # ct=1 only in batch 0
+    try:
+        sampler_edge = CelltypeBatchStratifiedSampler(
+            celltype_codes=edge_ct,
+            batch_codes=edge_b,
+            batch_size=4,
+            seed=0,
+        )
+        kept_cts = {ct for ct, _, _ in sampler_edge.group_summary()}
+        print(f"  ✗ edge case did NOT drop ct=1: kept celltypes = {sorted(kept_cts)}")
+    except ValueError as e:
+        print(f"  ✓ edge case rejected with ValueError (as expected): {e}")

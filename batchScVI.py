@@ -185,7 +185,7 @@ if USE_CONT_COVS:
     )
 else:
     print("⚠ --no-cont-cov: 跳过 n_genes_on 计算")
-# 训练只用 CON（control）细胞 —— pair-MSE 应该在没有任何 stress 干扰的
+# 训s练只用 CON（control）细胞 —— pair-MSE 应该在没.,,,,,,,swc有任何 stress 干扰的
 # 状态下学习跨 company 的对齐；其它 status 的生物差异不应进入 pair 梯度。
 TRAIN_STATUSES = ["CON"]
 adata_subset = adata_all[adata_all.obs.status.isin(TRAIN_STATUSES)].copy()
