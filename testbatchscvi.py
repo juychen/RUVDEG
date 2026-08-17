@@ -22,6 +22,7 @@ sys.path.insert(0, "/home/junyichen/code/RUVAEDEG")
 
 import numpy as np
 import pandas as pd
+import scvi
 import torch
 from scipy.sparse import csr_matrix, issparse
 from torch.utils.data import Sampler
@@ -637,6 +638,89 @@ print(
 )
 
 
+# %%
+# ========== Decode pair-model z with a pretrained SCVI model (encode1) ==========
+# Load the separately-trained ``encode1`` (no-batch scVI on TH,
+# /data3/junyi/scvi_nobatch/TH_scVImodel.model) and use its decoder to map
+# the pair model's ``z`` to reconstructed counts and normalized expression.
+# This evaluates what an aligned pair embedding looks like through the lens
+# of an independently-trained baseline decoder.
+ENCODE1_DIR = "/data3/junyi/scvi_nobatch/TH_scVImodel.model"
+
+encode1 = scvi.model.SCVI.load(ENCODE1_DIR, adata=adata_scvi)
+print(f"encode1 loaded     : {type(encode1).__name__}")
+print(f"encode1.n_latent   : {encode1.module.n_latent}")
+print(f"encode1.use_observed_lib_size: {encode1.module.use_observed_lib_size}")
+
+# Re-fetch z_pair in case the prior block trimmed it. Cheap relative to the rest.
+z_pair = model.get_latent_representation(adata=adata_scvi, batch_size=512)
+
+# Single pass through the loader: compute both reconstruction (each cell's
+# own library size, when encode1 was trained with use_observed_lib_size=True)
+# and normalized expression (shared library size, np.log(1e4)) from encode1's
+# decoder using the pair-model latent.
+encode1.module.eval()
+D1_counts_list = []
+D1_norm_list = []
+with torch.no_grad():
+    encode1_loader = encode1._make_data_loader(
+        adata=adata_scvi,
+        indices=np.arange(adata_scvi.n_obs),
+        batch_size=512,
+        shuffle=False,
+    )
+    cell_start = 0
+    for tensors in encode1_loader:
+        inference_inputs = encode1.module._get_inference_input(tensors)
+        inference_outputs = encode1.module.inference(**inference_inputs)
+        generative_inputs = encode1.module._get_generative_input(
+            tensors,
+            inference_outputs,
+        )
+
+        cell_stop = cell_start + tensors["X"].shape[0]
+        generative_inputs[MODULE_KEYS.Z_KEY] = torch.as_tensor(
+            z_pair[cell_start:cell_stop],
+            dtype=inference_outputs[MODULE_KEYS.Z_KEY].dtype,
+            device=inference_outputs[MODULE_KEYS.Z_KEY].device,
+        )
+
+        # Reconstruction: keep encode1's per-cell library input.
+        generated = encode1.module.generative(**generative_inputs)
+        D1_counts_list.append(
+            generated[MODULE_KEYS.PX_KEY].mu.detach().cpu()
+        )
+
+        # Normalized: replace library with log(SCVI_LIBRARY_SIZE) so every
+        # cell is decoded under the same total magnitude (10k).
+        generative_inputs[MODULE_KEYS.LIBRARY_KEY] = torch.full_like(
+            generative_inputs[MODULE_KEYS.LIBRARY_KEY],
+            np.log(SCVI_LIBRARY_SIZE),
+        )
+        generated_norm = encode1.module.generative(**generative_inputs)
+        D1_norm_list.append(
+            generated_norm[MODULE_KEYS.PX_KEY].mu.detach().cpu()
+        )
+        cell_start = cell_stop
+
+D1_counts = torch.cat(D1_counts_list, dim=0).numpy()
+adata_scvi.layers["batchpair_D1_counts"] = to_sparse_int(D1_counts)
+
+D1_normalized = torch.cat(D1_norm_list, dim=0).numpy().astype(np.float32)
+adata_scvi.layers["batchpair_D1_normlized"] = csr_matrix(D1_normalized)
+
+print(
+    f"batchpair_D1_counts shape   : {D1_counts.shape}  "
+    f"range=[{D1_counts.min():.2f}, {D1_counts.max():.2f}]  "
+    f"median={np.median(D1_counts):.2f}"
+)
+print(
+    f"batchpair_D1_normlized shape: {D1_normalized.shape}  "
+    f"range=[{D1_normalized.min():.2f}, {D1_normalized.max():.2f}]  "
+    f"library_size={SCVI_LIBRARY_SIZE:g}"
+)
+
+
 hkg_priority = [
     "Aars", "Sars", "Polr2a", "Polr2f", "Psmd6", "Psmd7", "Psma5",
     "Rer1", "Ipo8", "Pop4", "Pes1", "Oaz1", "Rpl13a", "Rpl27",
@@ -676,6 +760,16 @@ else:
             "scvi_beirui_normalized",
             "hkg_dotplot_scvi_beirui_normalized",
             "Native SCVI -> beirui normalized",
+        ),
+        (
+            "batchpair_D1_counts",
+            "hkg_dotplot_batchpair_D1_counts",
+            "Pair-MSE D1 counts",
+        ),
+        (
+            "batchpair_D1_normlized",
+            "hkg_dotplot_batchpair_D1_normalized",
+            "Pair-MSE D1 normalized",
         ),
         ("counts", "hkg_dotplot_raw", "raw counts"),
     ]:
