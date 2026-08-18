@@ -44,21 +44,26 @@ from scipy.stats import false_discovery_control
 from scipy.sparse import csr_matrix, issparse
 
 
-def to_sparse_int(arr):
-    """把 numpy / float / 稀疏数组转换成 (n_cells, n_genes) 的 csr int 矩阵。
+def to_sparse_int(arr, dtype=np.int32):
+    """Convert an array to CSR while preserving floats when requested.
 
-    - 输入若为稀疏矩阵：保持格式，只把 dtype 转成 int32。
-    - 输入若为稠密 ndarray：rint 截断后构造 csr（counts 必须是离散整数）。
-    - 用于把 decoder 抽样得到的 counts 写入 adata.layers["..."]，避免 h5ad
-      把 float 数组按 ~8 字节/元素存储（counts 通常很稀疏 + 数值小）。
+    Integer dtypes are used for count-like outputs and are rounded first.
+    Floating-point dtypes are used for normalization outputs and keep their
+    continuous values without rounding.
     """
-    if issparse(arr):
-        return csr_matrix(arr).astype(np.int32)
-    arr = np.asarray(arr)
-    if arr.ndim == 1:
-        # 防御性：误传 1D 时强制 reshape 成单行矩阵
-        arr = arr.reshape(1, -1)
-    return csr_matrix(np.rint(arr).astype(np.int32))
+    if not issparse(arr):
+        arr = np.asarray(arr)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+
+    result = csr_matrix(arr)
+    dtype = np.dtype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        result.data = np.rint(result.data).astype(dtype)
+    else:
+        result = result.astype(dtype)
+    result.eliminate_zeros()
+    return result
 
 
 # ===== 命令行参数（与 scVI.py 对齐；Jupyter 中可省略） =====
@@ -86,6 +91,11 @@ parser.add_argument(
     help="labels_key，注册到 scVI（限制 pair-MSE 在同一 cell type 内）",
 )
 parser.add_argument(
+    "--condition-key",
+    default=None,
+    help="可选 condition 列；指定后按 celltype.L2 + condition 分组 pair，且使用全部细胞训练",
+)
+parser.add_argument(
     "--no-cont-cov",
     action="store_true",
     help="不传入连续协变量 (n_genes_on)",
@@ -101,6 +111,14 @@ parser.add_argument(
 parser.add_argument(
     "--pair-weight", type=float, default=1.0,
     help="pair-MSE 项在总 loss 中的权重（默认 1.0；0 等价于退化为普通 scVI）",
+)
+parser.add_argument(
+    "--lr", type=float, default=1e-3,
+    help="training learning rate passed to plan_kwargs (default: 1e-3)",
+)
+parser.add_argument(
+    "--max-epochs", type=int, default=None,
+    help="maximum training epochs; None uses scVI automatic epoch selection",
 )
 parser.add_argument(
     "--align-on",
@@ -125,6 +143,11 @@ parser.add_argument(
     help="external decode 结果写入 adata.layers 的前缀（默认 batchpair_D1 → "
          "batchpair_D1_counts / batchpair_D1_normlized）。",
 )
+parser.add_argument(
+    "--finetune-model-dir",
+    default="",
+    help="可选：已训练好的 scVI 模型目录；指定后用其匹配的权重初始化当前模型再 finetune",
+)
 args, _ = parser.parse_known_args()
 
 INPUT_H5AD = os.path.abspath(args.input)
@@ -134,11 +157,15 @@ N_LAYERS = args.n_layers
 USE_CONT_COVS = not args.no_cont_cov
 SHOW_COMPARE = not args.no_compare
 PAIR_WEIGHT = float(args.pair_weight)
+LEARNING_RATE = float(args.lr)
+MAX_EPOCHS = args.max_epochs
 ALIGN_ON = args.align_on
 PAIR_BATCH_KEY = args.pair_batch_key
 LABELS_KEY = args.labels_key
+CONDITION_KEY = args.condition_key
 EXTERNAL_MODEL_DIR = args.external_model_dir.strip() or None
 EXTERNAL_MODEL_PREFIX = args.external_model_prefix
+FINETUNE_MODEL_DIR = args.finetune_model_dir.strip() or None
 DO_EXTERNAL_DECODE = bool(EXTERNAL_MODEL_DIR)
 
 # Strip the extension so all outputs share one base path: <base>.<suffix>
@@ -153,13 +180,41 @@ print(f"out base      : {OUTBASE}")
 print(f"model dir     : {MODEL_DIR}")
 print(f"external-decode: enabled={DO_EXTERNAL_DECODE}  "
       f"dir={EXTERNAL_MODEL_DIR!r}  prefix={EXTERNAL_MODEL_PREFIX!r}")
+print(f"finetune-from: {FINETUNE_MODEL_DIR!r}")
 print(f"n_latent={N_LATENT}  n_layers={N_LAYERS}  use_cont_cov={USE_CONT_COVS}")
 print(f"pair_weight={PAIR_WEIGHT}  align_on={ALIGN_ON}  "
-      f"pair_batch_key={PAIR_BATCH_KEY!r}  labels_key={LABELS_KEY!r}")
+    f"pair_batch_key={PAIR_BATCH_KEY!r}  labels_key={LABELS_KEY!r}  "
+    f"condition_key={CONDITION_KEY!r}  lr={LEARNING_RATE:g}  "
+    f"max_epochs={MAX_EPOCHS}")
 
 # %%
 # ===== 1. 数据读取 =====
 adata_all = sc.read_h5ad(INPUT_H5AD)
+
+if CONDITION_KEY is not None:
+    if CONDITION_KEY not in adata_all.obs.columns:
+        raise KeyError(
+            f"condition key {CONDITION_KEY!r} 不在 adata.obs 中，"
+            f"现有列: {adata_all.obs.columns.tolist()}"
+        )
+    if LABELS_KEY not in adata_all.obs.columns:
+        raise KeyError(
+            f"labels key {LABELS_KEY!r} 不在 adata.obs 中，"
+            f"现有列: {adata_all.obs.columns.tolist()}"
+        )
+
+    pair_group_key = "_pair_group"
+    adata_all.obs[pair_group_key] = (
+        adata_all.obs[LABELS_KEY].astype(str)
+        + "__"
+        + adata_all.obs[CONDITION_KEY].astype(str)
+    ).astype("category")
+    LABELS_KEY = pair_group_key
+    print(
+        f"condition-aware pairing enabled: {CONDITION_KEY!r} + "
+        f"{args.labels_key!r} -> {LABELS_KEY!r} "
+        f"({adata_all.obs[LABELS_KEY].nunique()} groups)"
+    )
 
 # %%
 # ===== 2. n_genes_on：在全量 adata_all 上算一次，训练 / eval 共享同一列 =====
@@ -185,11 +240,18 @@ if USE_CONT_COVS:
     )
 else:
     print("⚠ --no-cont-cov: 跳过 n_genes_on 计算")
-# 训s练只用 CON（control）细胞 —— pair-MSE 应该在没.,,,,,,,swc有任何 stress 干扰的
-# 状态下学习跨 company 的对齐；其它 status 的生物差异不应进入 pair 梯度。
-TRAIN_STATUSES = ["CON"]
-adata_subset = adata_all[adata_all.obs.status.isin(TRAIN_STATUSES)].copy()
-print(f"training subset (status in {TRAIN_STATUSES}): {adata_subset.shape}")
+# 默认保持旧逻辑：只用 CON 训练。指定 condition-key 后使用全量细胞，
+# 并由 celltype + condition 分组保证不同 condition 不会产生 pair。
+if CONDITION_KEY is None:
+    TRAIN_STATUSES = ["CON"]
+    adata_subset = adata_all[adata_all.obs.status.isin(TRAIN_STATUSES)].copy()
+    print(f"training subset (status in {TRAIN_STATUSES}): {adata_subset.shape}")
+else:
+    adata_subset = adata_all.copy()
+    print(
+        f"condition-aware training: all cells, "
+        f"condition_key={CONDITION_KEY!r}: {adata_subset.shape}"
+    )
 
 # adata_eval 用全部数据 —— 后面 external-decode 和 HKG dotplot 用这个。
 adata_eval = adata_all.copy()
@@ -297,7 +359,29 @@ print(f"pair_weight     : {model.module.pair_weight}")
 print(f"align_on        : {model.module.align_on}")
 print(f"n_input genes   : {model.module.n_input}")
 
-model.train(accelerator=TRAIN_ACCELERATOR, devices=TRAIN_DEVICES)
+if FINETUNE_MODEL_DIR is not None:
+    print(f"loading finetune initialization: {FINETUNE_MODEL_DIR!r}")
+    finetune_source = scvi.model.SCVI.load(FINETUNE_MODEL_DIR)
+    source_state = finetune_source.module.state_dict()
+    target_state = model.module.state_dict()
+    compatible_state = {
+        name: value
+        for name, value in source_state.items()
+        if name in target_state and target_state[name].shape == value.shape
+    }
+    skipped_state = sorted(set(source_state) - set(compatible_state))
+    model.module.load_state_dict(compatible_state, strict=False)
+    print(
+        f"✓ loaded {len(compatible_state)} matching parameter tensors; "
+        f"skipped {len(skipped_state)} incompatible tensors"
+    )
+
+model.train(
+    max_epochs=MAX_EPOCHS,
+    accelerator=TRAIN_ACCELERATOR,
+    devices=TRAIN_DEVICES,
+    plan_kwargs={"lr": LEARNING_RATE},
+)
 model.save(MODEL_DIR, overwrite=True, save_anndata=False)
 print(f"✓ saved model: {MODEL_DIR}")
 
