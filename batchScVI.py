@@ -420,6 +420,7 @@ print(f"fraction non-zero: {(reconstructed > 0).mean():.3f}")
 
 # 稀疏 int 写入 layer
 adata_subset.layers["scvi_reconstructed_counts"] = to_sparse_int(reconstructed)
+# find zero genes
 
 # 持久化 AnnData + 模型
 adata_subset.write_h5ad(OUTBASE + ".h5ad", compression="gzip")
