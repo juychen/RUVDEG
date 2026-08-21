@@ -122,7 +122,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--align-on",
-    default="mu",
+    default="z",
     choices=["mu", "z"],
     help="pair-MSE 对齐的量：'mu' (decoder rate, 默认) 或 'z' (latent)",
 )

@@ -71,12 +71,11 @@ adata_subset = adata[
         adata.obs["celltype.L2"].value_counts().head(N_CT).index[1:N_CT]
     )
 ]
+adata_subset = adata_subset[adata_subset.obs["sex"] == "M"]
 
-SLIDE_FIG_DIR = Path("slide_fig2")
+SLIDE_FIG_DIR = Path("slide_fig")
 SLIDE_FIG_DIR.mkdir(parents=True, exist_ok=True)
-# adata_subset = adata_subset[adata_subset.obs["sex"] == "M"]
-# adata_subset = adata_subset[adata_subset.obs["status"].isin(["CON"])]
-adata_subset.obs["celltype.L2"] = adata_subset.obs["celltype.L2"].astype(str) + "_" + adata_subset.obs["Model"].astype(str)
+adata_subset = adata_subset[adata_subset.obs["status"].isin(["CON"])]
 adata_subset = adata_subset.copy()  # small slice for fast iteration
 
 print(f"adata_subset shape: {adata_subset.shape}")
@@ -326,21 +325,6 @@ umap_fig.savefig(SLIDE_FIG_DIR / "umap_pair_model.png", dpi=300, bbox_inches="ti
 umap_fig.savefig(SLIDE_FIG_DIR / "umap_pair_model.pdf", bbox_inches="tight")
 plt.close(umap_fig)
 
-# %%
-# ========== iLISI + silhouette: how well are batches mixed? ==========
-try:
-    sce.pp.lisi_knn(
-        adata_scvi,
-        key=["company", "status"],
-        use_rep="X_scVI_pair",
-    )
-    ilisi_batch = float(adata_scvi.obsm["X_lisi_company"].mean())
-    ilisi_status = float(adata_scvi.obsm["X_lisi_status"].mean())
-    n_batch = adata_scvi.obs["company"].nunique()
-    print(f"iLISI (company):  {ilisi_batch:.3f}   (max = {n_batch}, larger = better mixed)")
-    print(f"iLISI (status):   {ilisi_status:.3f}   (small = biology preserved)")
-except Exception as exc:
-    print(f"[warn] scanpy.external unavailable: {exc}")
 
 asw_batch = silhouette_score(adata_scvi.obsm["X_scVI_pair"], adata_scvi.obs["company"])
 status_labels = adata_scvi.obs["status"].astype(str)
@@ -357,7 +341,7 @@ print(f"ASW (status,  ↑): {asw_bio:.4f}" if np.isfinite(asw_bio)
 # ========== Compare to plain SCVI (no pair loss) ==========
 _SCVI.setup_anndata(
     adata_scvi,
-    batch_key="company",
+    batch_key=None,
     labels_key=None,
     continuous_covariate_keys=["n_genes_on"],
 )
@@ -489,7 +473,7 @@ scvi_reconstructed = m_plain.posterior_predictive_sample(
     adata=adata_scvi,
     n_samples=1,
     batch_size=512,
-    transform_batch=[SCVI_TRANSFORM_BATCH],
+    transform_batch=None,
     silent=False,
 )
 
@@ -517,7 +501,7 @@ adata_scvi.layers["scvi_beirui_counts"] = to_sparse_int(scvi_reconstructed)
 SCVI_LIBRARY_SIZE = 1e4
 scvi_beirui_normalized = m_plain.get_normalized_expression(
     adata=adata_scvi,
-    transform_batch=[SCVI_TRANSFORM_BATCH],
+    transform_batch=None,
     library_size=SCVI_LIBRARY_SIZE,
     batch_size=512,
     return_numpy=True,
@@ -641,57 +625,32 @@ print(
 
 
 # %%
-# ========== Decode pair-model z with a pretrained SCVI model (encode1) ==========
-# Load the separately-trained ``encode1`` (no-batch scVI on TH,
-# /data3/junyi/scvi_nobatch/TH_scVImodel.model) and use its decoder to map
-# the pair model's ``z`` to reconstructed counts and normalized expression.
-# This evaluates what an aligned pair embedding looks like through the lens
-# of an independently-trained baseline decoder.
-ENCODE1_DIR = "/data3/junyi/scvi_nobatch/TH_scVImodel.model"
-
-# encode1 原始 setup（从 checkpoint registry 确认）：
-#   batch_key=None, labels_key=None, categorical_covariate_keys=None,
-#   continuous_covariate_keys=['n_genes_on']
-# 因此 encode1 的 decoder 只接受 n_genes_on 这一个连续协变量。
-# 不能直接传 adata_scvi —— 它上面残留 pair 模型的 manager（_pair_batch、
-# labels），SCVI.load 会把这些额外输入注册进 encode1，导致解码出的 mu 异常低。
-# 这里复制一份干净 adata：保留 n_genes_on，删除 _pair_batch，清掉旧 _scvi_* 注册。
-adata_encode1 = adata_scvi.copy()
-for key in ["_pair_batch"]:
-    if key in adata_encode1.obs.columns:
-        del adata_encode1.obs[key]
-for k in list(adata_encode1.uns.keys()):
-    if k.startswith("_scvi_"):
-        del adata_encode1.uns[k]
-adata_encode1.obs["n_genes_on"] = adata_encode1.obs["n_genes_on"].astype(np.float32)
-
-encode1 = scvi.model.SCVI.load(ENCODE1_DIR, adata=adata_encode1)
-print(f"encode1 loaded     : {type(encode1).__name__}")
-print(f"encode1.n_latent   : {encode1.module.n_latent}")
-print(f"encode1.use_observed_lib_size: {encode1.module.use_observed_lib_size}")
-
+# ========== Decode pair-model z with the in-script plain SCVI (m_plain) ==========
+# 不加载外部 encode1，直接使用本脚本训练的 m_plain（batch_key=None,
+# labels_key=None, continuous_covariate_keys=['n_genes_on']）解码 pair 模型的 z。
+# m_plain 与 encode1 结构同构（n_latent=32, n_layers=2, zinb, n_genes_on covariate），
+# 且其 manager 已经注册在 adata_scvi 上，loader 直接复用 adata_scvi 即可。
 # Re-fetch z_pair in case the prior block trimmed it. Cheap relative to the rest.
 z_pair = model.get_latent_representation(adata=adata_scvi, batch_size=512)
 
 # Single pass through the loader: compute both reconstruction (each cell's
-# own library size, when encode1 was trained with use_observed_lib_size=True)
-# and normalized expression (shared library size, np.log(1e4)) from encode1's
-# decoder using the pair-model latent.
-encode1.module.eval()
+# own library size) and normalized expression (shared library size,
+# np.log(1e4)) from m_plain's decoder using the pair-model latent.
+m_plain.module.eval()
 D1_counts_list = []
 D1_norm_list = []
 with torch.no_grad():
-    encode1_loader = encode1._make_data_loader(
-        adata=adata_encode1,
-        indices=np.arange(adata_encode1.n_obs),
+    mplain_loader = m_plain._make_data_loader(
+        adata=adata_scvi,
+        indices=np.arange(adata_scvi.n_obs),
         batch_size=512,
         shuffle=False,
     )
     cell_start = 0
-    for tensors in encode1_loader:
-        inference_inputs = encode1.module._get_inference_input(tensors)
-        inference_outputs = encode1.module.inference(**inference_inputs)
-        generative_inputs = encode1.module._get_generative_input(
+    for tensors in mplain_loader:
+        inference_inputs = m_plain.module._get_inference_input(tensors)
+        inference_outputs = m_plain.module.inference(**inference_inputs)
+        generative_inputs = m_plain.module._get_generative_input(
             tensors,
             inference_outputs,
         )
@@ -703,8 +662,8 @@ with torch.no_grad():
             device=inference_outputs[MODULE_KEYS.Z_KEY].device,
         )
 
-        # Reconstruction: keep encode1's per-cell library input.
-        generated = encode1.module.generative(**generative_inputs)
+        # Reconstruction: keep m_plain's per-cell library input.
+        generated = m_plain.module.generative(**generative_inputs)
         D1_counts_list.append(
             generated[MODULE_KEYS.PX_KEY].mu.detach().cpu()
         )
@@ -715,7 +674,7 @@ with torch.no_grad():
             generative_inputs[MODULE_KEYS.LIBRARY_KEY],
             np.log(SCVI_LIBRARY_SIZE),
         )
-        generated_norm = encode1.module.generative(**generative_inputs)
+        generated_norm = m_plain.module.generative(**generative_inputs)
         D1_norm_list.append(
             generated_norm[MODULE_KEYS.PX_KEY].mu.detach().cpu()
         )
