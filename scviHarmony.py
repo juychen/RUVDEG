@@ -57,11 +57,17 @@ parser.add_argument(
     "--n-layers", type=int, default=2,
     help="编码器/解码器层数（默认 2）",
 )
+parser.add_argument(
+    "--no-compare", action="store_true",
+    help="跳过末尾的 HKG dotplot（仍会训练、Harmony 解码并写 h5ad）",
+)
 # ===== Harmony 特有参数 =====
 parser.add_argument(
-    "--harmony-batch",
+    "--batch-key", "--harmony-batch",
+    dest="batch_key",
     default="company",
-    help="run_harmony 的 vars_use：用于 batch 校正的 obs 列名（默认 company）",
+    help="用于 Harmony batch 校正的 obs 列名（默认 company）；"
+         "--harmony-batch 为兼容旧命令保留",
 )
 parser.add_argument(
     "--nclust", type=str, default="celltype.L2",
@@ -81,12 +87,13 @@ INPUT_H5AD = os.path.abspath(args.input)
 OUTPREFIX = os.path.abspath(args.outprefix)
 N_LATENT = args.n_latent
 N_LAYERS = args.n_layers
+SHOW_COMPARE = not args.no_compare
 # 本 pipeline 的 SCVI 不用 batch key：batch 校正交给 Harmony（run_harmony 的 vars_use）
 # 因此 batch_key 恒为 None，transform_batch 恒为 None。
 USE_BATCH = False
 USE_CONT_COVS = not args.no_cont_cov
 
-HARMONY_BATCH = args.harmony_batch
+HARMONY_BATCH = args.batch_key
 NCLUST_RAW = args.nclust
 LAMB = args.lamb
 MAX_ITER_HARMONY = args.max_iter_harmony
@@ -108,26 +115,18 @@ print(f"harmony    : vars_use={HARMONY_BATCH}  nclust={NCLUST_RAW}  lamb={LAMB} 
 # ===== 数据读取 =====
 adata_subset = sc.read_h5ad(INPUT_H5AD)
 
-# 关键列 value counts —— 与 RUVDEG 一致的元信息
-for col in ["status", "company", "celltype.L2", "sex", "sample", "region"]:
-    if col in adata_subset.obs.columns:
-        vc = adata_subset.obs[col].value_counts()
-        print(f"\n{col} (n_unique={vc.size}):")
-        print(vc.head(10))
+if HARMONY_BATCH not in adata_subset.obs.columns:
+    raise KeyError(
+        f"Harmony batch key {HARMONY_BATCH!r} 不在 adata.obs 中；"
+        f"可用列: {list(adata_subset.obs.columns)}"
+    )
+
 
 # %%
 # === 3. 数据结构探索（SCVI setup 前置） ===
 print(f"shape: {adata_subset.shape}")
 print(f"X dtype : {adata_subset.X.dtype}   X range: [{adata_subset.X.min()}, {adata_subset.X.max()}]")
 print(f"layers  : {[k for k in adata_subset.layers.keys() if k is not None]}")
-
-# 关键列 value counts —— 与 RUVDEG 一致的元信息
-for col in ["status", "company", "celltype.L2", "sex", "sample", "region"]:
-    if col in adata_subset.obs.columns:
-        vc = adata_subset.obs[col].value_counts()
-        print(f"\n{col} (n_unique={vc.size}):")
-        print(vc.head(10))
-
 # 解析 nclust（type=str 所以纯数字也是字符串）：
 #   - 纯数字字符串 -> int（如 --nclust 3）
 #   - obs 列名     -> 取该列 unique 类别数（如默认 celltype.L2）
@@ -143,10 +142,8 @@ else:
 print(f"nclust: {NCLUST}")
 
 # %%
-adata_subset.obs.status.value_counts()
-
 # %%
-adata_subset.layers["counts"]
+adata_subset.layers["counts"] = adata_subset.X.copy()
 
 # %%
 # === 5. n_genes_on 协变量（mirror RUVDEG cell 4） ===
@@ -178,7 +175,7 @@ adata_subset.X = adata_subset.layers["counts"].copy()
 # === 6. SCVI setup_anndata（mirror RUVDEG covariate 设计） ===
 #
 # 本 pipeline：batch 校正由 Harmony 完成，SCVI 不注册 batch key。
-#   batch (技术)         -> None（SCVI 不用；run_harmony vars_use 用 HARMONY_BATCH）
+#   batch (技术)         -> None（SCVI 不用；run_harmony vars_use 用 BATCH_KEY）
 #   n_genes_on (连续)    -> continuous_covariate_keys=["n_genes_on"]（--no-cont-cov 时 None）
 #   group (生物学 status) -> NOT 注册：SCVI 无监督，biology 体现在 latent z；
 #                              保留在 adata.obs["status"] 供下游 DEG 使用。
@@ -254,7 +251,8 @@ SCVI_LATENT_KEY = "X_scVI"
 adata_subset.obsm[SCVI_LATENT_KEY] = model.get_latent_representation()
 
 # %%
-adata_subset.obsm['X_pcaBACK'] = adata_subset.obsm['X_pca'].copy()
+if "X_pca" in adata_subset.obsm:
+    adata_subset.obsm['X_pcaBACK'] = adata_subset.obsm['X_pca'].copy()
 
 
 # %%
@@ -483,6 +481,14 @@ print(f"row sum (lib_size=1e4): {X_norm_harmony.sum(axis=1).mean():.0f}")
 
 adata_subset.layers["scvi_nrom_counts_harmony"] = X_norm_harmony
 
+
+adata_subset.write_h5ad(OUTBASE + ".h5ad", compression="gzip")
+print(f"✓ saved: {OUTBASE}.h5ad")
+
+if not SHOW_COMPARE:
+    print("⚠ --no-compare: skip HKG dotplot")
+    raise SystemExit(0)
+
 # %%
 recon_custom
 
@@ -544,10 +550,10 @@ print(f"HKG available: {len(hkg_genes)} / {len(set(hkg_priority))}")
 #    用 set_categories 而非 reorder_categories：某些数据（如 ICTX）缺少某个 status
 #    （例如没有 CURES），reorder_categories 要求新旧类别一致会报错；
 #    set_categories 允许缺失类别，只强制固定顺序。
-adata_subset.obs["status"] = adata_subset.obs["status"].astype("category")
-adata_subset.obs["status"] = adata_subset.obs["status"].cat.set_categories(
-    ["CON", "CURES", "CUSUS", "CSRES", "CSSUS"]
-)
+# adata_subset.obs["status"] = adata_subset.obs["status"].astype("category")
+# adata_subset.obs["status"] = adata_subset.obs["status"].cat.set_categories(
+#     ["CON", "CURES", "CUSUS", "CSRES", "CSSUS"]
+# )
 
 # 3) 共享颜色尺度：把 reconstructed_counts 一起看，避免每 panel 自适应
 recon = adata_subset.layers["scvi_reconstructed_counts_harmony"]
@@ -561,7 +567,7 @@ sc.settings.figdir = OUTDIR
 fig = sc.pl.dotplot(
     adata_subset,
     var_names=hkg_genes,
-    groupby="sample",
+    groupby=BATCH_KEY,
     layer="scvi_reconstructed_counts_harmony",
     cmap="Reds",
     standard_scale=None,     # 用真实 counts 量级，跨组可比
@@ -579,7 +585,7 @@ sc.settings.figdir = OUTDIR
 fig = sc.pl.dotplot(
     adata_subset,
     var_names=hkg_genes,
-    groupby="sample",
+    groupby=BATCH_KEY,
     layer="counts",
     cmap="Reds",
     standard_scale=None,     # 用真实 counts 量级，跨组可比
@@ -614,5 +620,3 @@ fig_out = OUTBASE + ".count_diff.png"
 fig.savefig(fig_out, bbox_inches="tight", dpi=200)
 print(f"✓ saved: {fig_out}")
 
-adata_subset.write_h5ad(OUTBASE + ".h5ad", compression="gzip")
-print(f"✓ saved: {OUTBASE}.h5ad")

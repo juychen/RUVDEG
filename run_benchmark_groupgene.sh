@@ -25,7 +25,7 @@ SKIP_GROUP_DEGS="${SKIP_GROUP_DEGS:-0}"  # 1 = --skip-group-degs
 OUT_ROOT="${OUT_ROOT:-/data3/junyi/benchmark_results}"
 MAX_JOBS="${MAX_JOBS:-4}"
 CONDA_ENV="${CONDA_ENV:-scvi-env}"
-PATTERN="${PATTERN:-*_batchscvi_full.h5ad}"
+PATTERN="${PATTERN:-*_scVI*.h5ad}"
 
 if [[ -n "$CONDA_ENV" ]] && command -v conda >/dev/null 2>&1; then
     source "$(conda info --base)/etc/profile.d/conda.sh"

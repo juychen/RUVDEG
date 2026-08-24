@@ -46,7 +46,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--transform-batch",
-    default="beirui",
+    default="auto",
     help="get_normalized_expression / posterior_predictive_sample 的 transform_batch 标签",
 )
 parser.add_argument(
@@ -54,6 +54,12 @@ parser.add_argument(
     action="store_true",
     help="不使用 batch key（batch_key=None，无 batch 校正）。此时 --transform-batch 会被忽略。",
 )
+parser.add_argument(
+    "--batch-key",
+    action="store_true",default="company",
+    help="batch key（默认 company）",
+)
+
 parser.add_argument(
     "--no-cont-cov",
     action="store_true",
@@ -102,12 +108,12 @@ adata_subset = sc.read_h5ad(INPUT_H5AD)
 
 # transform_batch 必须是当前数据中实际存在的 company；缺失时使用细胞数最多的 company。
 if USE_BATCH:
-    if "company" not in adata_subset.obs.columns:
-        raise KeyError("使用 batch 校正时，adata.obs 必须包含 'company' 列")
+    if argparse.batch_key not in adata_subset.obs.columns:
+        raise KeyError("使用 batch 校正时，adata.obs 必须包含 batch_key 列")
 
-    company_counts = adata_subset.obs["company"].dropna().astype(str).value_counts()
+    company_counts = adata_subset.obs[argparse.batch_key].dropna().astype(str).value_counts()
     if company_counts.empty:
-        raise ValueError("adata.obs['company'] 没有有效值，无法选择 transform_batch")
+        raise ValueError(f"adata.obs['{argparse.batch_key}'] 没有有效值，无法选择 transform_batch")
 
     if TRANSFORM_BATCH not in company_counts.index:
         requested_transform_batch = TRANSFORM_BATCH
@@ -119,14 +125,6 @@ if USE_BATCH:
         )
 
 print(f"resolved transform_batch: {TRANSFORM_BATCH!r}")
-
-# 关键列 value counts —— 与 RUVDEG 一致的元信息
-for col in ["status", "company", "celltype.L2", "sex", "sample", "region"]:
-    if col in adata_subset.obs.columns:
-        vc = adata_subset.obs[col].value_counts()
-        print(f"\n{col} (n_unique={vc.size}):")
-        print(vc.head(10))
-
 
 
 # %%
@@ -168,7 +166,7 @@ adata_subset.X = adata_subset.layers["counts"].copy()
 
 # --no-batch 时 BATCH_KEY=None：scvi 不注册 batch 字段，模型完全不使用 batch
 # --no-cont-cov 时 CONT_COVS=None：scvi 不注册任何连续协变量
-BATCH_KEY = "company" if USE_BATCH else None
+BATCH_KEY = argparse.batch_key if USE_BATCH else None
 CONT_COVS = ["n_genes_on"] if USE_CONT_COVS else None
 
 scvi.model.SCVI.setup_anndata(
@@ -422,10 +420,10 @@ print(f"HKG available: {len(hkg_genes)} / {len(set(hkg_priority))}")
 #    用 set_categories 而非 reorder_categories：某些数据（如 ICTX）缺少某个 status
 #    （例如没有 CURES），reorder_categories 要求新旧类别一致会报错；
 #    set_categories 允许缺失类别，只强制固定顺序。
-adata_subset.obs["status"] = adata_subset.obs["status"].astype("category")
-adata_subset.obs["status"] = adata_subset.obs["status"].cat.set_categories(
-    ["CON", "CURES", "CUSUS", "CSRES", "CSSUS"]
-)
+# adata_subset.obs["status"] = adata_subset.obs["status"].astype("category")
+# adata_subset.obs["status"] = adata_subset.obs["status"].cat.set_categories(
+#     ["CON", "CURES", "CUSUS", "CSRES", "CSSUS"]
+# )
 
 # 3) 共享颜色尺度：把 reconstructed_counts 一起看，避免每 panel 自适应
 recon = adata_subset.layers["scvi_reconstructed_counts"]

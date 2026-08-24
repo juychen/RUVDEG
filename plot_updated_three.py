@@ -1,33 +1,44 @@
-"""Regenerate 3 plots from updated batchscvi_full data:
+"""Regenerate 3 plots from updated batchscvi_full + batchscvi_con data:
 
 1. delta_best bar plot (per region × model, lower = better)
 2. mean ROC bar plot (per region × model, lower = better)
 3. ROC curve: empirical CDF of per-(gene, company) AUC for each model
    (left-hugging curve = better residual batch correction)
 
-Data source: /data3/junyi/benchmark_results/*_hkg_auc.csv
+Data sources:
+  - /data3/junyi/benchmark_results/*_batchscvi_full/*_batchscvi_full_hkg_auc.csv
+  - /data3/junyi/benchmark_results/*_batchscvi_con/condtion_batch_hkg_auc.csv
+  - /data3/junyi/benchmark_results/*_scVImodel/*_scVImodel_hkg_auc.csv
+  - /data3/junyi/benchmark_results/*_scviHarmony/*_scviHarmony_hkg_auc.csv
 """
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-CSV_GLOB = "/data3/junyi/benchmark_results/*/*_hkg_auc.csv"
+CSV_PATTERNS = [
+    "/data3/junyi/benchmark_results/*_batchscvi_full/*_batchscvi_full_hkg_auc.csv",
+    "/data3/junyi/benchmark_results/*_batchscvi_con/condtion_batch_hkg_auc.csv",
+    "/data3/junyi/benchmark_results/*_scVImodel/*_scVImodel_hkg_auc.csv",
+    "/data3/junyi/benchmark_results/*_scviHarmony/*_scviHarmony_hkg_auc.csv",
+]
 OUT_DIR  = Path("/home/junyichen/code/RUVAEDEG")
 
 PALETTE = {
-    "raw":          "#52514e",  # charcoal for raw
-    "scvi":         "#2a78d6",  # blue
-    "scviHarmony":  "#1baf7a",  # aqua
-    "batchscvi_full": "#7a5e9e",  # violet
+    "raw":             "#52514e",  # charcoal for raw
+    "scvi":            "#2a78d6",  # blue
+    "scviHarmony":     "#1baf7a",  # aqua
+    "batchscvi_full":  "#7a5e9e",  # violet
+    "batchscvi_con":   "#d62728",  # red
 }
 
-MODEL_ORDER = ["scVImodel", "scviHarmony", "batchscvi_full"]
+MODEL_ORDER = ["scVImodel", "scviHarmony", "batchscvi_full", "batchscvi_con"]
 LABEL = {
-    "raw":           "raw",
-    "scVImodel":     "scVI",
-    "scviHarmony":   "scVI+Harmony",
-    "batchscvi_full":"paired-batch scVI (D1)",
+    "raw":              "raw",
+    "scVImodel":        "scVI",
+    "scviHarmony":      "scVI+Harmony",
+    "batchscvi_full":   "paired-batch scVI (D1)",
+    "batchscvi_con":    "paired-batch scVI + cond",
 }
 
 
@@ -41,32 +52,37 @@ GRID   = "#e1e0d9"
 def collect():
     """Return a DataFrame with per-region × model metrics."""
     rows = []
-    for path in sorted(__import__("glob").glob(CSV_GLOB)):
-        base = Path(path).stem.replace("_hkg_auc", "")
-        if base.endswith("_batchscvi_full"):
-            model = "batchscvi_full"
-            region = base[:-len("_batchscvi_full")]
-        elif base.endswith("_scviHarmony"):
-            model = "scviHarmony"
-            region = base[:-len("_scviHarmony")]
-        elif base.endswith("_scVImodel"):
-            model = "scVImodel"
-            region = base[:-len("_scVImodel")]
-        else:
-            continue
-        df = pd.read_csv(path)
-        per_gene = df.drop_duplicates("gene")[["gene", "best_raw", "best_corr", "delta_best"]]
-        rows.append({
-            "region": region,
-            "model": model,
-            "mean_raw": per_gene["best_raw"].mean(),
-            "mean_corr": per_gene["best_corr"].mean(),
-            "mean_delta_best": per_gene["delta_best"].mean(),
-            "best_raw": per_gene["best_raw"].values,
-            "best_corr": per_gene["best_corr"].values,
-            "all_raw_auc": df["raw_AUC"].values,
-            "all_corr_auc": df["corr_AUC"].values,
-        })
+    for pattern in CSV_PATTERNS:
+        for path in sorted(__import__("glob").glob(pattern)):
+            base = Path(path).stem.replace("_hkg_auc", "")
+            parent = Path(path).parent.name
+            if parent.endswith("_batchscvi_full"):
+                model = "batchscvi_full"
+                region = parent[:-len("_batchscvi_full")]
+            elif parent.endswith("_batchscvi_con"):
+                model = "batchscvi_con"
+                region = parent[:-len("_batchscvi_con")]
+            elif parent.endswith("_scviHarmony"):
+                model = "scviHarmony"
+                region = parent[:-len("_scviHarmony")]
+            elif parent.endswith("_scVImodel"):
+                model = "scVImodel"
+                region = parent[:-len("_scVImodel")]
+            else:
+                continue
+            df = pd.read_csv(path)
+            per_gene = df.drop_duplicates("gene")[["gene", "best_raw", "best_corr", "delta_best"]]
+            rows.append({
+                "region": region,
+                "model": model,
+                "mean_raw": per_gene["best_raw"].mean(),
+                "mean_corr": per_gene["best_corr"].mean(),
+                "mean_delta_best": per_gene["delta_best"].mean(),
+                "best_raw": per_gene["best_raw"].values,
+                "best_corr": per_gene["best_corr"].values,
+                "all_raw_auc": df["raw_AUC"].values,
+                "all_corr_auc": df["corr_AUC"].values,
+            })
     return pd.DataFrame(rows)
 
 
@@ -87,11 +103,12 @@ def plot_delta(df, out_png):
     for i, model in enumerate(MODEL_ORDER):
         sub = df[df["model"] == model].set_index("region").reindex(regions)
         vals = sub["mean_delta_best"].values
-        offsets = x + (i - 1) * bar_w
+        offsets = x + (i - (len(MODEL_ORDER) - 1) / 2) * bar_w
         # map raw internal model name to PALETTE key
         palette_key = {"scVImodel": "scvi",
                        "scviHarmony": "scviHarmony",
-                       "batchscvi_full": "batchscvi_full"}[model]
+                       "batchscvi_full": "batchscvi_full",
+                       "batchscvi_con":  "batchscvi_con"}[model]
         bars = ax.bar(offsets, vals, width=bar_w,
                       color=PALETTE[palette_key],
                       edgecolor=INK, linewidth=0.5,
@@ -138,8 +155,8 @@ def plot_delta(df, out_png):
 # ---------- plot 2: mean ROC bars ----------
 def plot_roc_bars(df, out_png):
     regions = sorted(df["region"].unique())
-    n_reg = len(regions); n_mod = 4
-    bar_w = 0.20
+    n_reg = len(regions); n_mod = len(MODEL_ORDER) + 1  # raw + each model
+    bar_w = 0.18
     x = np.arange(n_reg)
 
     fig, ax = plt.subplots(figsize=(13.0, 6.2), dpi=160)
@@ -151,9 +168,10 @@ def plot_roc_bars(df, out_png):
     # raw (use pooled mean across models)
     raw_per_region = df.groupby("region")["mean_raw"].mean().reindex(regions)
     others = [
-        ("scvi",          "scVImodel"),
-        ("scviHarmony",   "scviHarmony"),
-        ("batchscvi_full","batchscvi_full"),
+        ("scvi",            "scVImodel"),
+        ("scviHarmony",     "scviHarmony"),
+        ("batchscvi_full",  "batchscvi_full"),
+        ("batchscvi_con",   "batchscvi_con"),
     ]
     series = [("raw", raw_per_region.values)] + [
         (lab, df[df["model"] == m].set_index("region")
@@ -163,9 +181,10 @@ def plot_roc_bars(df, out_png):
 
     for i, (lab, vals) in enumerate(series):
         offsets = x + (i - (n_mod - 1) / 2) * bar_w
+        label_name = LABEL[lab] if lab == "raw" else LABEL[{"scvi": "scVImodel", "scviHarmony": "scviHarmony", "batchscvi_full": "batchscvi_full", "batchscvi_con": "batchscvi_con"}[lab]]
         bars = ax.bar(offsets, vals, width=bar_w * 0.92,
                       color=PALETTE[lab], edgecolor=INK, linewidth=0.5,
-                      label=LABEL[lab if lab == "raw" else {"scvi": "scVImodel", "scviHarmony": "scviHarmony", "batchscvi_full": "batchscvi_full"}[lab]],
+                      label=label_name,
                       zorder=3)
         for b, v in zip(bars, vals):
             ax.text(b.get_x() + b.get_width()/2, v + 0.005,
@@ -186,7 +205,7 @@ def plot_roc_bars(df, out_png):
     ax.yaxis.grid(True, color=GRID, lw=0.6, zorder=0); ax.set_axisbelow(True)
 
     leg = ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.005),
-                    ncol=4, frameon=False, fontsize=9.5,
+                    ncol=n_mod, frameon=False, fontsize=9.5,
                     handlelength=1.6, handletextpad=0.5, columnspacing=1.6,
                     labelcolor=INK)
     for h in leg.legend_handles:
@@ -247,7 +266,8 @@ def plot_roc_curve(df, out_png):
         ecdf = np.arange(1, n + 1) / n
         palette_key = {"scVImodel": "scvi",
                        "scviHarmony": "scviHarmony",
-                       "batchscvi_full": "batchscvi_full"}[model]
+                       "batchscvi_full": "batchscvi_full",
+                       "batchscvi_con":  "batchscvi_con"}[model]
         ax.plot(sorted_vals, ecdf, color=PALETTE[palette_key], lw=2.2,
                 label=LABEL[model], zorder=4)
 
@@ -312,17 +332,19 @@ def main():
     print()
 
     # overall summary
-    print("=== per-region summary (raw / scVI / scVI+Harmony / batchscvi) ===")
+    print("=== per-region summary (raw / scVI / scVI+Harmony / batchscvi / batchscvi+cond) ===")
     regions = sorted(df["region"].unique())
-    print(f"{'region':<6} {'raw':>6} {'scVI':>6} {'scVI+Harm':>10} {'batchscvi':>10} {'Δ_batchscvi':>12}")
+    print(f"{'region':<6} {'raw':>6} {'scVI':>6} {'scVI+Harm':>10} {'batchscvi':>10} {'batchscvi+cond':>14} {'Δ_bsc':>8} {'Δ_bsc+cond':>12}")
     for r in regions:
         sub = df[df["region"] == r]
         raw = sub["mean_raw"].mean()
         scvi = sub[sub["model"]=="scVImodel"]["mean_corr"].iat[0]
         harm = sub[sub["model"]=="scviHarmony"]["mean_corr"].iat[0]
         bsc = sub[sub["model"]=="batchscvi_full"]["mean_corr"].iat[0]
+        bsc_con = sub[sub["model"]=="batchscvi_con"]["mean_corr"].iat[0]
         delta = bsc - raw
-        print(f"{r:<6} {raw:>6.3f} {scvi:>6.3f} {harm:>10.3f} {bsc:>10.3f} {delta:>+12.3f}")
+        delta_con = bsc_con - raw
+        print(f"{r:<6} {raw:>6.3f} {scvi:>6.3f} {harm:>10.3f} {bsc:>10.3f} {bsc_con:>14.3f} {delta:>+8.3f} {delta_con:>+12.3f}")
     print()
     print("=== mean across regions ===")
     grp = df.groupby("model").agg(
