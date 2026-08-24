@@ -16,12 +16,14 @@ OUT_ROOT="/data1st1/junyi/correctdata/transformed"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
 NCLUST="10"
-HARMONY_BATCH=("protocol" "source_file")
+#HARMONY_BATCH=("protocol" "source_file")
+HARMONY_BATCH=("source_file")
+
 LAMB=0.3
 MAX_ITER_HARMONY=20
 
-ALL_REGIONS=(GSE118767 GSE133549)
-#ALL_REGIONS=(iCTX)
+#ALL_REGIONS=(GSE118767 GSE133549)
+ALL_REGIONS=(GSE133549)
 
 # ---- Optional conda env ----
 # Hardcoded source line removed: activation is handled here so the script
@@ -66,6 +68,7 @@ run_one() {
         --harmony-batch "$harmony_batch" \
         --lamb "$LAMB" \
         --max-iter-harmony "$MAX_ITER_HARMONY" \
+        --no-compare \
         >"$log" 2>&1
     local rc=$?
     if [[ $rc -eq 0 ]]; then

@@ -36,6 +36,28 @@ from scipy.sparse import csr_matrix, issparse
 from sklearn.metrics import roc_auc_score
 
 
+# ----------------------------- defaults / constants -----------------------------
+HK_PRIORITY = [
+    # 结构/骨架
+    "Actb", "Tuba1a", "Ubc", "Uba52",
+    # 蛋白酶体/折叠
+    "Psmd6", "Psmd7", "Psma5",
+    "Hsp90aa1", "Hsp90ab1",
+    "Ywhaz",
+    # 线粒体
+    "Sdha", "Cyc1",
+    "Cox4i1", "Cox5b",
+    "Ndufb8",
+    "Atp5f1b",
+    # 翻译/转录
+    "Eef1a1",
+    "Rplp0", "Rpl19", "Rps18",
+    "Polr2a",
+    "Tbp",
+    # 代谢
+    "Ppia", "Pgk1",
+]
+
 
 # ----------------------------- helpers -----------------------------
 def to_sparse_int(arr, dtype=np.float32):
@@ -289,17 +311,6 @@ def main():
         count_layer=args.count_layer,
         force_rescale=not args.no_rescale,
     )
-    df_genegroup = pd.read_excel('/data2st2/junyi/code/sn/data/All_degs_N_v0715FF.xlsx')
-    for group in df_genegroup['group'].unique():
-        genes = df_genegroup.loc[df_genegroup['group'] == group, 'gene'].tolist()
-        if group == 'other':
-            continue
-        else:
-            globals()[f"{group}_GENES"] = genes
-
-            for model in adata.obs['Model'].unique():
-                ad_con = adata[(adata.obs["Model"] == model) | (adata.obs["Model"] == args.model)].copy()
-
 
     # Step 2: HK-gene one-vs-rest AUC (CON subset of the chosen Model)
     ad_con = adata[adata.obs["Model"] == args.model].copy()
