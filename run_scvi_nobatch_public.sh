@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
 # ============================================================
-# Run scviHarmony.py DEG pipeline on all 8 brain-region datasets.
+# Run scVI.py with --no-batch (no batch correction) on the two
+# public benchmark datasets (GSE118767 / GSE133549).
 # At most ${MAX_JOBS} jobs run concurrently.
 #
+# Mirrors run_scvi_harmony_public.sh but passes --no-batch so that
+# scVI is trained without registering any batch_key (pure baseline).
+#
 # Usage:
-#   ./run_scvi_harmony.sh                          # run all 8 regions
-#   ./run_scvi_harmony.sh iCTX TH                  # run only these regions
+#   ./run_scvi_nobatch_public.sh                       # run both datasets
+#   ./run_scvi_nobatch_public.sh GSE118767             # run one only
+#   ./run_scvi_nobatch_public.sh GSE118767 GSE133549   # run selected
 # ============================================================
 set -euo pipefail
 
 # ---- Config (edit here) ----
-SCRIPT="/home/junyichen/code/RUVAEDEG/scviHarmony.py"
+SCRIPT="/home/junyichen/code/RUVAEDEG/scVI.py"
 INPUT_DIRS=(/data1st1/junyi/correctdata/publicdata)
 OUT_ROOT="/data1st1/junyi/correctdata/transformed"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
-NCLUST="5"
-#HARMONY_BATCH=("protocol" "source_file")
-HARMONY_BATCH=("source_file")
 
-LAMB=0.3
-MAX_ITER_HARMONY=20
+# scVI hyperparameters (kept identical to the harmonised version for fairness)
+N_LATENT=32
+N_LAYERS=2
 
-#ALL_REGIONS=(GSE118767 GSE133549)
 ALL_REGIONS=(GSE118767 GSE133549)
 
 # ---- Optional conda env ----
-# Hardcoded source line removed: activation is handled here so the script
-# works with any conda install and can be disabled by setting CONDA_ENV="".
 if [[ -n "$CONDA_ENV" ]] && command -v conda >/dev/null 2>&1; then
     # shellcheck disable=SC1091
     source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -44,14 +44,11 @@ python -c "import scvi" >/dev/null 2>&1 || {
 run_one() {
     local input_dir="$1"
     local region="$2"
-    local harmony_batch="$3"
-    local dataset
-    dataset="$(basename "$input_dir")"
-    dataset="${region}"
-    local out_dir="${OUT_ROOT}/${dataset}_scviharmony"
+    local dataset="${region}"                         # use region name as dataset id
+    local out_dir="${OUT_ROOT}/${dataset}_scVInobatch"
     local input="${input_dir}/${region}.h5ad"
-    local outprefix="${out_dir}/${region}_scviHarmony.h5ad"
-    local log="${out_dir}/${region}_scviHarmony.log"
+    local outprefix="${out_dir}/${region}_scVInobatch.h5ad"
+    local log="${out_dir}/${region}_scVInobatch.log"
 
     mkdir -p "$out_dir"
 
@@ -64,10 +61,9 @@ run_one() {
     python "$SCRIPT" \
         -i "$input" \
         -o "$outprefix" \
-        --nclust "$NCLUST" \
-        --harmony-batch "$harmony_batch" \
-        --lamb "$LAMB" \
-        --max-iter-harmony "$MAX_ITER_HARMONY" \
+        --no-batch \
+        --n-latent "$N_LATENT" \
+        --n-layers "$N_LAYERS" \
         --no-compare \
         >"$log" 2>&1
     local rc=$?
@@ -79,7 +75,7 @@ run_one() {
     return $rc
 }
 export -f run_one
-export SCRIPT OUT_ROOT NCLUST LAMB MAX_ITER_HARMONY
+export SCRIPT OUT_ROOT N_LATENT N_LAYERS
 
 # ---- Main ----
 if [[ $# -gt 0 ]]; then
@@ -88,24 +84,16 @@ else
     REGIONS=("${ALL_REGIONS[@]}")
 fi
 
-echo "[CONFIG] script=$SCRIPT  max_jobs=$MAX_JOBS  input_dirs=${#INPUT_DIRS[@]}"
-if [[ ${#ALL_REGIONS[@]} -ne ${#HARMONY_BATCH[@]} ]]; then
-    echo "[ERROR] ALL_REGIONS and HARMONY_BATCH must have the same length" >&2
-    exit 1
-fi
+echo "[CONFIG] script=$SCRIPT  max_jobs=$MAX_JOBS  input_dirs=${#INPUT_DIRS[@]}  regions=${REGIONS[*]}"
+
 for input_dir in "${INPUT_DIRS[@]}"; do
     if [[ ! -d "$input_dir" ]]; then
         echo "[WARN] input directory not found: $input_dir" >&2
         continue
     fi
     for region in "${REGIONS[@]}"; do
-        for idx in "${!ALL_REGIONS[@]}"; do
-            if [[ "${ALL_REGIONS[$idx]}" == "$region" ]]; then
-                printf '%s\t%s\t%s\n' "$input_dir" "$region" "${HARMONY_BATCH[$idx]}"
-                break
-            fi
-        done
+        printf '%s\t%s\n' "$input_dir" "$region"
     done
-done | xargs -P "$MAX_JOBS" -n 3 bash -c 'run_one "$1" "$2" "$3"' _
+done | xargs -P "$MAX_JOBS" -n 2 bash -c 'run_one "$1" "$2"' _
 
 echo "[ALL] finished"

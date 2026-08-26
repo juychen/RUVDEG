@@ -133,6 +133,8 @@ print(f"resolved transform_batch: {TRANSFORM_BATCH!r}")
 # 与 RUVDEG 完全一致：mean/std 由本次数据估计，z-score 后写入 adata.obs["n_genes_on"]。
 # 仅在 --no-cont-cov 未开启（USE_CONT_COVS=True）时才需要计算。
 if USE_CONT_COVS:
+    if "counts" not in adata_subset.layers:
+        adata_subset.layers["counts"] = adata_subset.X.copy()
     n_genes_on_raw = (adata_subset.layers["counts"] > 0).sum(axis=1).astype(np.float32)
     n_genes_on_mean = float(n_genes_on_raw.mean())
     n_genes_on_std  = float(n_genes_on_raw.std())
