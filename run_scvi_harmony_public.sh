@@ -16,8 +16,8 @@ OUT_ROOT="/data1st1/junyi/correctdata/transformed"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
 NCLUST="5"
-#HARMONY_BATCH=("protocol" "source_file")
-HARMONY_BATCH=("source_file")
+HARMONY_BATCH=("protocol" "source_file")
+#HARMONY_BATCH=("source_file")
 
 LAMB=0.3
 MAX_ITER_HARMONY=20

@@ -221,6 +221,13 @@ if CONDITION_KEY is not None:
 # 用全量数据 (μ_all, σ_all) 做 z-score，避免训练 (CON-only) 和 eval (全量)
 # 两套统计量带来的协变量分布漂移。
 if USE_CONT_COVS:
+    if "counts" not in adata_all.layers:
+        if adata_all.X is None:
+            raise KeyError(
+                "layers['counts'] 缺失且 X 为空，无法自动生成 counts layer"
+            )
+        print("⚠ layers['counts'] 缺失: 将 X.copy() 写入 counts layer")
+        adata_all.layers["counts"] = adata_all.X.copy()
     n_genes_on_raw = (adata_all.layers["counts"] > 0).sum(axis=1).astype(np.float32)
     n_genes_on_mean = float(n_genes_on_raw.mean())
     n_genes_on_std = float(n_genes_on_raw.std())
@@ -242,16 +249,24 @@ else:
     print("⚠ --no-cont-cov: 跳过 n_genes_on 计算")
 # 默认保持旧逻辑：只用 CON 训练。指定 condition-key 后使用全量细胞，
 # 并由 celltype + condition 分组保证不同 condition 不会产生 pair。
-if CONDITION_KEY is None:
+# 若数据没有 status 列（如公共数据），自动退化为全细胞训练。
+if CONDITION_KEY is None and "status" in adata_all.obs.columns:
     TRAIN_STATUSES = ["CON"]
     adata_subset = adata_all[adata_all.obs.status.isin(TRAIN_STATUSES)].copy()
     print(f"training subset (status in {TRAIN_STATUSES}): {adata_subset.shape}")
 else:
+    if CONDITION_KEY is None:
+        print(
+            "⚠ no --condition-key and 'status' not in obs: "
+            "falling back to training on ALL cells"
+        )
+    else:
+        print(
+            f"condition-aware training: all cells, "
+            f"condition_key={CONDITION_KEY!r}"
+        )
     adata_subset = adata_all.copy()
-    print(
-        f"condition-aware training: all cells, "
-        f"condition_key={CONDITION_KEY!r}: {adata_subset.shape}"
-    )
+    print(f"training subset (all cells): {adata_subset.shape}")
 
 # adata_eval 用全部数据 —— 后面 external-decode 和 HKG dotplot 用这个。
 adata_eval = adata_all.copy()
@@ -289,7 +304,10 @@ adata_subset.X = adata_subset.layers["counts"].copy()
 # 避免 one_hot 收到 4-D int tensor 时报 expand 错。
 mask = adata_subset.obs[PAIR_BATCH_KEY].notna()
 adata_subset = adata_subset[mask].copy()
-adata_subset.obs[PAIR_BATCH_KEY] = adata_subset.obs[PAIR_BATCH_KEY].astype("category")
+# scvi-tools 的 _make_column_categorical 要求列必须是 pandas Categorical
+# dtype（object/str 会报 "Expected categories ... Received categories"）。
+for _cat_key in {PAIR_BATCH_KEY, LABELS_KEY}:
+    adata_subset.obs[_cat_key] = adata_subset.obs[_cat_key].astype("category")
 if USE_CONT_COVS:
     adata_subset.obs["n_genes_on"] = adata_subset.obs["n_genes_on"].astype(np.float32)
 print(f"after dropna shape : {adata_subset.shape}")
@@ -450,6 +468,10 @@ if not bool(eval_mask.all()):
 print(f"adata_eval after NaN drop : {adata_eval.shape}")
 
 # 强制 dtype，与训练子集保持一致
+# scvi-tools 的 _make_column_categorical 要求 Categorical dtype，
+# .copy() 后 object 列不会自动变 category，需在 eval 集上重转。
+for _cat_key in {PAIR_BATCH_KEY, LABELS_KEY}:
+    adata_eval.obs[_cat_key] = adata_eval.obs[_cat_key].astype("category")
 if USE_CONT_COVS:
     adata_eval.obs["n_genes_on"] = adata_eval.obs["n_genes_on"].astype(np.float32)
     print(
@@ -472,7 +494,7 @@ SCVIWithBatchPairLoss.setup_anndata(
 print(f"  manager uuid (eval)     : {adata_eval.uns['_scvi_manager_uuid'][:8]}…")
 
 # 后续所有下游步骤（外部模型解码、HKG dotplot）都改在 adata_eval 上做。
-# 注意：保存 h5ad 时用 OUTBASE_FULL = <OUTBASE>_full.h5ad，避免覆盖训练子集。
+# 注意：保存 h5ad 时用 OUTBASE_FULL = <OUTBASE>_full.h5ad，避免覆盖训练子集 h5ad 不动。
 OUTBASE_FULL = OUTBASE + "_full"
 OUTDIR_FULL = os.path.dirname(OUTBASE_FULL) or "."
 os.makedirs(OUTDIR_FULL, exist_ok=True)
@@ -609,15 +631,26 @@ for g in hkg_priority:
         hkg_genes.append(g)
 print(f"HKG available: {len(hkg_genes)} / {len(set(hkg_priority))}")
 
-adata_eval.obs["status"] = adata_eval.obs["status"].astype("category")
-adata_eval.obs["status"] = adata_eval.obs["status"].cat.set_categories(
-    ["CON", "CURES", "CUSUS", "CSRES", "CSSUS"]
-)
+# 画图分组列：优先 'sample'，没有则退化为 pair-batch 列。
+# status 分类顺序也只在 status 列存在时才设置。
+PLOT_GROUPBY = "sample" if "sample" in adata_eval.obs.columns else PAIR_BATCH_KEY
+if PLOT_GROUPBY != "sample":
+    print(f"⚠ 'sample' not in obs: dotplot groupby falls back to {PLOT_GROUPBY!r}")
+
+if SHOW_COMPARE:
+    if "status" in adata_eval.obs.columns:
+        adata_eval.obs["status"] = adata_eval.obs["status"].astype("category")
+        adata_eval.obs["status"] = adata_eval.obs["status"].cat.set_categories(
+            ["CON", "CURES", "CUSUS", "CSRES", "CSSUS"]
+        )
+    else:
+        print("⚠ 'status' not in obs: skip status category ordering")
 
 # adata_eval 上的 reconstructed counts layer 是 pair model 在 adata_eval
 # 上重新抽样得到的（重新运行 posterior_predictive_sample 一次）。
 # 但训练子集 adata_subset 上已经写过一份 layer；为简化，这里直接跑一次
 # posterior_predictive_sample 到 adata_eval 上，覆盖写入同名的 layer。
+# 无论是否画图都执行，保证 h5ad 里始终有 scvi_reconstructed_counts。
 recon_eval = model.posterior_predictive_sample(
     adata=adata_eval,
     n_samples=1,
@@ -628,109 +661,111 @@ recon_eval = model.posterior_predictive_sample(
 recon_eval = np.asarray(recon_eval.todense())
 adata_eval.layers["scvi_reconstructed_counts"] = to_sparse_int(recon_eval)
 
-recon = adata_eval.layers["scvi_reconstructed_counts"]
-recon_arr = recon.toarray() if hasattr(recon, "toarray") else np.asarray(recon)
-vmin = float(np.percentile(recon_arr[recon_arr > 0], 5))
-vmax = float(np.percentile(recon_arr, 95))
-print(f"shared color: vmin={vmin:.2f}, vmax={vmax:.2f}")
+if SHOW_COMPARE:
+    recon = adata_eval.layers["scvi_reconstructed_counts"]
+    recon_arr = recon.toarray() if hasattr(recon, "toarray") else np.asarray(recon)
+    vmin = float(np.percentile(recon_arr[recon_arr > 0], 5))
+    vmax = float(np.percentile(recon_arr, 95))
+    print(f"shared color: vmin={vmin:.2f}, vmax={vmax:.2f}")
 
-sc.settings.figdir = OUTDIR_FULL
-fig = sc.pl.dotplot(
-    adata_eval,
-    var_names=hkg_genes,
-    groupby="sample",
-    layer="scvi_reconstructed_counts",
-    cmap="Reds",
-    standard_scale=None,
-    swap_axes=False,
-    dendrogram=False,
-    return_fig=True,
-    show=False,
-    save="batchscvi_full_hkg_recon_status.png",
-)
-fig_out = OUTBASE_FULL + ".hkg_recon_status.png"
-fig.savefig(fig_out, bbox_inches="tight", dpi=200)
-print(f"✓ saved: {fig_out}")
-
-sc.settings.figdir = OUTDIR_FULL
-fig = sc.pl.dotplot(
-    adata_eval,
-    var_names=hkg_genes,
-    groupby="sample",
-    layer="counts",
-    cmap="Reds",
-    standard_scale=None,
-    swap_axes=False,
-    dendrogram=False,
-    return_fig=True,
-    show=False,
-    save="batchscvi_full_raw_status.png",
-)
-fig_out = OUTBASE_FULL + ".raw_status.png"
-fig.savefig(fig_out, bbox_inches="tight", dpi=200)
-print(f"✓ saved: {fig_out}")
-
-adata_eval.layers["count_diff"] = to_sparse_int(
-    adata_eval.layers["scvi_reconstructed_counts"] - adata_eval.layers["counts"]
-)
-fig = sc.pl.dotplot(
-    adata_eval,
-    var_names=hkg_genes,
-    groupby="sample",
-    layer="count_diff",
-    cmap="bwr",
-    expression_cutoff=-1000,
-    standard_scale=None,
-    swap_axes=False,
-    dendrogram=False,
-    return_fig=True,
-    show=False,
-    save="batchscvi_full_count_diff.png",
-)
-fig_out = OUTBASE_FULL + ".count_diff.png"
-fig.savefig(fig_out, bbox_inches="tight", dpi=200)
-print(f"✓ saved: {fig_out}")
-
-
-# ----- 可选：external-decode 层的 HKG dotplot -----
-ext_counts_layer = f"{EXTERNAL_MODEL_PREFIX}_counts"
-ext_norm_layer = f"{EXTERNAL_MODEL_PREFIX}_normlized"
-
-if ext_counts_layer in adata_eval.layers:
+    sc.settings.figdir = OUTDIR_FULL
     fig = sc.pl.dotplot(
         adata_eval,
         var_names=hkg_genes,
-        groupby="sample",
-        layer=ext_counts_layer,
+        groupby=PLOT_GROUPBY,
+        layer="scvi_reconstructed_counts",
         cmap="Reds",
         standard_scale=None,
         swap_axes=False,
         dendrogram=False,
         return_fig=True,
         show=False,
-        save="batchscvi_full_hkg_ext_counts.png",
+        save="batchscvi_full_hkg_recon_status.png",
     )
-    fig_out = OUTBASE_FULL + f".hkg_{ext_counts_layer}.png"
+    fig_out = OUTBASE_FULL + ".hkg_recon_status.png"
     fig.savefig(fig_out, bbox_inches="tight", dpi=200)
     print(f"✓ saved: {fig_out}")
 
-if ext_norm_layer in adata_eval.layers:
+    sc.settings.figdir = OUTDIR_FULL
     fig = sc.pl.dotplot(
         adata_eval,
         var_names=hkg_genes,
-        groupby="sample",
-        layer=ext_norm_layer,
+        groupby=PLOT_GROUPBY,
+        layer="counts",
         cmap="Reds",
         standard_scale=None,
         swap_axes=False,
         dendrogram=False,
         return_fig=True,
         show=False,
-        save="batchscvi_full_hkg_ext_normlized.png",
+        save="batchscvi_full_raw_status.png",
     )
-    fig_out = OUTBASE_FULL + f".hkg_{ext_norm_layer}.png"
+    fig_out = OUTBASE_FULL + ".raw_status.png"
     fig.savefig(fig_out, bbox_inches="tight", dpi=200)
     print(f"✓ saved: {fig_out}")
+
+    adata_eval.layers["count_diff"] = to_sparse_int(
+        adata_eval.layers["scvi_reconstructed_counts"] - adata_eval.layers["counts"]
+    )
+    fig = sc.pl.dotplot(
+        adata_eval,
+        var_names=hkg_genes,
+        groupby=PLOT_GROUPBY,
+        layer="count_diff",
+        cmap="bwr",
+        expression_cutoff=-1000,
+        standard_scale=None,
+        swap_axes=False,
+        dendrogram=False,
+        return_fig=True,
+        show=False,
+        save="batchscvi_full_count_diff.png",
+    )
+    fig_out = OUTBASE_FULL + ".count_diff.png"
+    fig.savefig(fig_out, bbox_inches="tight", dpi=200)
+    print(f"✓ saved: {fig_out}")
+
+    # ----- 可选：external-decode 层的 HKG dotplot -----
+    ext_counts_layer = f"{EXTERNAL_MODEL_PREFIX}_counts"
+    ext_norm_layer = f"{EXTERNAL_MODEL_PREFIX}_normlized"
+
+    if ext_counts_layer in adata_eval.layers:
+        fig = sc.pl.dotplot(
+            adata_eval,
+            var_names=hkg_genes,
+            groupby=PLOT_GROUPBY,
+            layer=ext_counts_layer,
+            cmap="Reds",
+            standard_scale=None,
+            swap_axes=False,
+            dendrogram=False,
+            return_fig=True,
+            show=False,
+            save="batchscvi_full_hkg_ext_counts.png",
+        )
+        fig_out = OUTBASE_FULL + f".hkg_{ext_counts_layer}.png"
+        fig.savefig(fig_out, bbox_inches="tight", dpi=200)
+        print(f"✓ saved: {fig_out}")
+
+    if ext_norm_layer in adata_eval.layers:
+        fig = sc.pl.dotplot(
+            adata_eval,
+            var_names=hkg_genes,
+            groupby=PLOT_GROUPBY,
+            layer=ext_norm_layer,
+            cmap="Reds",
+            standard_scale=None,
+            swap_axes=False,
+            dendrogram=False,
+            return_fig=True,
+            show=False,
+            save="batchscvi_full_hkg_ext_normlized.png",
+        )
+        fig_out = OUTBASE_FULL + f".hkg_{ext_norm_layer}.png"
+        fig.savefig(fig_out, bbox_inches="tight", dpi=200)
+        print(f"✓ saved: {fig_out}")
+else:
+    print("⚠ --no-compare: skip HKG dotplots (and posterior_predictive_sample on eval set)")
 
 # ----- 持久化最终全量结果 -----
 adata_eval.write_h5ad(OUTBASE_FULL + ".h5ad", compression="gzip")
