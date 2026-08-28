@@ -1,32 +1,23 @@
 # %%
-"""batchScVI.py — SCVIWithBatchPairLoss pipeline (mirror of scVI.py CLI).
+"""batchScVI_v2.py — two-stage pipeline: plain scVI (nobatch) → pair model.
 
-Inherits the same CLI surface as ``scVI.py`` (input h5ad, outprefix,
-n_latent, n_layers, …) but swaps the native ``scvi.model.SCVI`` for
-``SCVIWithBatchPairLoss`` from ``model_scvi_batch_pair``. Pair-MSE
-alignment is added on top of the standard scVI loss.
+Stage 1 (mirror of scVI.py --no-batch):
+    Train a plain ``scvi.model.SCVI`` WITHOUT any batch indicator on the
+    same adata (CON cells by default). The model is saved to
+    ``<outbase>_scvi_nobatch.model``. Because it is trained on the exact
+    same adata as stage 2, no external-model loading / gene-space alignment
+    is ever needed.
+
+Stage 2 (mirror of batchScVI.py):
+    Train ``SCVIWithBatchPairLoss`` (pair-MSE alignment) on the same adata
+    to minimize batch difference on top of the stage-1 baseline.
 
 Outputs (all written under the same ``--outprefix``):
-    <outbase>.h5ad
-        AnnData with corrected layers (``scvi_nrom_counts``,
-        ``scvi_reconstructed_counts``) + latent ``X_scVI`` in ``obsm``.
-    <outbase>.model/
-        Trained SCVIWithBatchPairLoss checkpoint.
-    <outbase>.hkg_recon_status.png``, ``.raw_status.png``, ``.count_diff.png``
-        Same HKG dotplots as ``scVI.py``.
-
-Notes on what differs from ``scVI.py``:
-    * ``setup_anndata`` uses ``pair_batch_obs_key="company"`` so the
-      pairing column is registered as an extra categorical covariate
-      (``_pair_batch``); ``batch_key=None`` so SCVI does NOT apply its
-      native batch-correction.
-    * The pair-MSE loss is purely extra — it does not replace scVI's
-      reconstruction / KL terms.
-    * ``transform_batch`` is only meaningful when a native SCVI batch
-      effect is registered. With ``batch_key=None`` (default here) it is
-      forced to ``None`` and ``get_normalized_expression`` /
-      ``posterior_predictive_sample`` decode every cell under its own
-      conditioning (no batch mixing).
+    <outbase>_scvi_nobatch.model/   stage-1 plain scVI checkpoint
+    <outbase>.h5ad                  pair-model results (CON subset)
+    <outbase>.model/                stage-2 pair model checkpoint
+    <outbase>_full.h5ad             full-data (all status) results
+    <outbase>_full.hkg_*.png        HKG dotplots
 """
 
 import argparse
@@ -40,17 +31,11 @@ import scvi
 import seaborn as sns
 import torch
 from rich import print
-from scipy.stats import false_discovery_control
 from scipy.sparse import csr_matrix, issparse
 
 
 def to_sparse_int(arr, dtype=np.int32):
-    """Convert an array to CSR while preserving floats when requested.
-
-    Integer dtypes are used for count-like outputs and are rounded first.
-    Floating-point dtypes are used for normalization outputs and keep their
-    continuous values without rounding.
-    """
+    """Convert an array to CSR while preserving floats when requested."""
     if not issparse(arr):
         arr = np.asarray(arr)
         if arr.ndim == 1:
@@ -66,9 +51,9 @@ def to_sparse_int(arr, dtype=np.int32):
     return result
 
 
-# ===== 命令行参数（与 scVI.py 对齐；Jupyter 中可省略） =====
+# ===== 命令行参数 =====
 parser = argparse.ArgumentParser(
-    description="SCVIWithBatchPairLoss pipeline (mirror of scVI.py CLI)"
+    description="Two-stage pipeline: plain scVI (nobatch) -> SCVIWithBatchPairLoss"
 )
 parser.add_argument(
     "--input", "-i",
@@ -88,7 +73,7 @@ parser.add_argument(
 parser.add_argument(
     "--labels-key",
     default="celltype.L2",
-    help="labels_key，注册到 scVI（限制 pair-MSE 在同一 cell type 内）",
+    help="labels_key，注册到 pair model（限制 pair-MSE 在同一 cell type 内）",
 )
 parser.add_argument(
     "--condition-key",
@@ -132,21 +117,9 @@ parser.add_argument(
     help="跳过末尾的 HKG dotplot（仍会训练、抽样并写 h5ad）",
 )
 parser.add_argument(
-    "--external-model-dir",
-    default="",
-    help="可选：另一份已经训练好的 scVI 模型目录（用于把当前 pair z 解码到该模型的 decoder）；"
-         "为空则跳过 external-decode 步骤。",
-)
-parser.add_argument(
-    "--external-model-prefix",
-    default="batchpair_D1",
-    help="external decode 结果写入 adata.layers 的前缀（默认 batchpair_D1 → "
-         "batchpair_D1_counts / batchpair_D1_normlized）。",
-)
-parser.add_argument(
-    "--finetune-model-dir",
-    default="",
-    help="可选：已训练好的 scVI 模型目录；指定后用其匹配的权重初始化当前模型再 finetune",
+    "--skip-stage1",
+    action="store_true",
+    help="跳过 stage-1 plain scVI 训练（若 <outbase>_scvi_nobatch.model 已存在）",
 )
 args, _ = parser.parse_known_args()
 
@@ -163,24 +136,19 @@ ALIGN_ON = args.align_on
 PAIR_BATCH_KEY = args.pair_batch_key
 LABELS_KEY = args.labels_key
 CONDITION_KEY = args.condition_key
-EXTERNAL_MODEL_DIR = args.external_model_dir.strip() or None
-EXTERNAL_MODEL_PREFIX = args.external_model_prefix
-FINETUNE_MODEL_DIR = args.finetune_model_dir.strip() or None
-DO_EXTERNAL_DECODE = bool(EXTERNAL_MODEL_DIR)
+SKIP_STAGE1 = args.skip_stage1
 
-# Strip the extension so all outputs share one base path: <base>.<suffix>
 OUTBASE = os.path.splitext(OUTPREFIX)[0]
 OUTDIR = os.path.dirname(OUTBASE) or "."
 MODEL_DIR = OUTBASE + ".model"
+STAGE1_MODEL_DIR = OUTBASE + "_scvi_nobatch.model"
 os.makedirs(OUTDIR, exist_ok=True)
 
-print(f"input h5ad    : {INPUT_H5AD}")
-print(f"out prefix    : {OUTPREFIX}")
-print(f"out base      : {OUTBASE}")
-print(f"model dir     : {MODEL_DIR}")
-print(f"external-decode: enabled={DO_EXTERNAL_DECODE}  "
-      f"dir={EXTERNAL_MODEL_DIR!r}  prefix={EXTERNAL_MODEL_PREFIX!r}")
-print(f"finetune-from: {FINETUNE_MODEL_DIR!r}")
+print(f"input h5ad      : {INPUT_H5AD}")
+print(f"out prefix      : {OUTPREFIX}")
+print(f"out base        : {OUTBASE}")
+print(f"stage-1 model   : {STAGE1_MODEL_DIR}")
+print(f"stage-2 model   : {MODEL_DIR}")
 print(f"n_latent={N_LATENT}  n_layers={N_LAYERS}  use_cont_cov={USE_CONT_COVS}")
 print(f"pair_weight={PAIR_WEIGHT}  align_on={ALIGN_ON}  "
     f"pair_batch_key={PAIR_BATCH_KEY!r}  labels_key={LABELS_KEY!r}  "
@@ -218,8 +186,6 @@ if CONDITION_KEY is not None:
 
 # %%
 # ===== 2. n_genes_on：在全量 adata_all 上算一次，训练 / eval 共享同一列 =====
-# 用全量数据 (μ_all, σ_all) 做 z-score，避免训练 (CON-only) 和 eval (全量)
-# 两套统计量带来的协变量分布漂移。
 if USE_CONT_COVS:
     if "counts" not in adata_all.layers:
         if adata_all.X is None:
@@ -238,7 +204,6 @@ if USE_CONT_COVS:
         (n_genes_on_raw - n_genes_on_mean) / n_genes_on_std
     ).astype(np.float32)
     adata_all.obs["n_genes_on"] = n_genes_on_z
-    # adata_subset / adata_eval 是 adata_all 的 view，obs 列会自动同步。
     print(f"n_genes_on (全量): raw μ/σ = {n_genes_on_mean:.1f} / {n_genes_on_std:.1f}")
     print(
         f"standardized range (all cells): "
@@ -247,9 +212,8 @@ if USE_CONT_COVS:
     )
 else:
     print("⚠ --no-cont-cov: 跳过 n_genes_on 计算")
-# 默认保持旧逻辑：只用 CON 训练。指定 condition-key 后使用全量细胞，
-# 并由 celltype + condition 分组保证不同 condition 不会产生 pair。
-# 若数据没有 status 列（如公共数据），自动退化为全细胞训练。
+
+# 训练子集：默认只用 CON（指定 condition-key 后用全量细胞）
 if CONDITION_KEY is None and "status" in adata_all.obs.columns:
     TRAIN_STATUSES = ["CON"]
     adata_subset = adata_all[adata_all.obs.status.isin(TRAIN_STATUSES)].copy()
@@ -268,7 +232,7 @@ else:
     adata_subset = adata_all.copy()
     print(f"training subset (all cells): {adata_subset.shape}")
 
-# adata_eval 用全部数据 —— 后面 external-decode 和 HKG dotplot 用这个。
+# adata_eval 用全部数据 —— 下游 encode / decode / HKG dotplot 用这个。
 adata_eval = adata_all.copy()
 print(f"eval / decode subset (all status)         : {adata_eval.shape}")
 
@@ -289,23 +253,14 @@ for col in ["status", "company", "celltype.L2", "sex", "sample", "region"]:
         print(f"\n{col} (n_unique={vc.size}):")
         print(vc.head(10))
 
-
-
-
-
 # %%
 # ===== 3. raw counts 写入 X =====
 adata_subset.X = adata_subset.layers["counts"].copy()
 
-
 # %%
 # ===== 4. Drop NaN + 强制 dtype（BEFORE scVI registration） =====
-# 与 testbatchscvi.py 一致：company 必须 category，n_genes_on 必须 float32，
-# 避免 one_hot 收到 4-D int tensor 时报 expand 错。
 mask = adata_subset.obs[PAIR_BATCH_KEY].notna()
 adata_subset = adata_subset[mask].copy()
-# scvi-tools 的 _make_column_categorical 要求列必须是 pandas Categorical
-# dtype（object/str 会报 "Expected categories ... Received categories"）。
 for _cat_key in {PAIR_BATCH_KEY, LABELS_KEY}:
     adata_subset.obs[_cat_key] = adata_subset.obs[_cat_key].astype("category")
 if USE_CONT_COVS:
@@ -314,33 +269,8 @@ print(f"after dropna shape : {adata_subset.shape}")
 print(f"{PAIR_BATCH_KEY} categories : "
       f"{adata_subset.obs[PAIR_BATCH_KEY].cat.categories.tolist()}")
 
-
 # %%
-# ===== 5. SCVIWithBatchPairLoss.setup_anndata =====
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model_scvi_batch_pair import SCVIWithBatchPairLoss  # noqa: E402
-from scvi.module._constants import MODULE_KEYS  # noqa: E402
-
-CONT_COVS = ["n_genes_on"] if USE_CONT_COVS else None
-
-# pair model 不注册 batch_key（SCVI 不应用 native batch effect）；
-# pair-batch 列被复制成 _pair_batch 后注册为 extra cat cov，仅用于 pair-MSE。
-SCVIWithBatchPairLoss.setup_anndata(
-    adata_subset,
-    pair_batch_obs_key=PAIR_BATCH_KEY,
-    batch_key=None,
-    labels_key=LABELS_KEY,
-    categorical_covariate_keys=None,
-    continuous_covariate_keys=CONT_COVS,
-)
-print(f"✓ SCVIWithBatchPairLoss.setup_anndata complete")
-print(f"  manager uuid: {adata_subset.uns['_scvi_manager_uuid'][:8]}…")
-print(f"  _pair_batch categories: "
-      f"{adata_subset.obs['_pair_batch'].cat.categories.tolist()}")
-
-
-# %%
-# ===== 6. Auto-select GPU =====
+# ===== 5. Auto-select GPU =====
 if torch.cuda.is_available():
     gpu_memory = []
     for gpu_idx in range(torch.cuda.device_count()):
@@ -360,9 +290,73 @@ else:
     TRAIN_DEVICES = 1
     print("CUDA not available, fallback to CPU")
 
+CONT_COVS = ["n_genes_on"] if USE_CONT_COVS else None
 
 # %%
-# ===== 7. 构造并训练模型 =====
+# ============================================================
+# ===== Stage 1: plain scVI WITHOUT batch indicator ==========
+# ============================================================
+# mirror of scVI.py --no-batch：batch_key=None, labels_key=None,
+# 只注册 X + n_genes_on。在同一个 adata_subset 上训练，因此与 stage-2
+# 完全同源 —— 不需要任何 external model 加载 / 基因对齐。
+if SKIP_STAGE1 and os.path.isdir(STAGE1_MODEL_DIR):
+    print(f"== stage-1 skipped (--skip-stage1): {STAGE1_MODEL_DIR} ==")
+else:
+    print(f"\n== stage-1: plain scVI (nobatch) on {adata_subset.shape} ==")
+    # 用独立副本注册，避免与 stage-2 的 pair model manager 互相覆盖 uuid
+    adata_stage1 = adata_subset.copy()
+    scvi.model.SCVI.setup_anndata(
+        adata_stage1,
+        layer=None,
+        batch_key=None,
+        labels_key=None,
+        categorical_covariate_keys=None,
+        continuous_covariate_keys=CONT_COVS,
+    )
+    print(f"✓ stage-1 setup_anndata complete  "
+          f"uuid: {adata_stage1.uns['_scvi_manager_uuid'][:8]}…")
+
+    stage1_model = scvi.model.SCVI(
+        adata_stage1, n_layers=N_LAYERS, n_latent=N_LATENT,
+        gene_likelihood="zinb",
+    )
+    stage1_model.train(
+        max_epochs=MAX_EPOCHS,
+        accelerator=TRAIN_ACCELERATOR,
+        devices=TRAIN_DEVICES,
+        plan_kwargs={"lr": LEARNING_RATE},
+    )
+    stage1_model.save(STAGE1_MODEL_DIR, overwrite=True, save_anndata=False)
+    print(f"✓ stage-1 model saved: {STAGE1_MODEL_DIR}")
+
+    # stage-1 baseline latent（写在训练子集上，供对比用）
+    adata_subset.obsm["X_scVI_nobatch"] = stage1_model.get_latent_representation()
+
+# %%
+# ============================================================
+# ===== Stage 2: SCVIWithBatchPairLoss (pair-MSE) ============
+# ============================================================
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from model_scvi_batch_pair import SCVIWithBatchPairLoss  # noqa: E402
+from scvi.module._constants import MODULE_KEYS  # noqa: E402
+
+print(f"\n== stage-2: SCVIWithBatchPairLoss on {adata_subset.shape} ==")
+
+# pair model 不注册 batch_key（SCVI 不应用 native batch effect）；
+# pair-batch 列被复制成 _pair_batch 后注册为 extra cat cov，仅用于 pair-MSE。
+SCVIWithBatchPairLoss.setup_anndata(
+    adata_subset,
+    pair_batch_obs_key=PAIR_BATCH_KEY,
+    batch_key=None,
+    labels_key=LABELS_KEY,
+    categorical_covariate_keys=None,
+    continuous_covariate_keys=CONT_COVS,
+)
+print(f"✓ stage-2 setup_anndata complete")
+print(f"  manager uuid: {adata_subset.uns['_scvi_manager_uuid'][:8]}…")
+print(f"  _pair_batch categories: "
+      f"{adata_subset.obs['_pair_batch'].cat.categories.tolist()}")
+
 model = SCVIWithBatchPairLoss(
     adata_subset,
     n_layers=N_LAYERS,
@@ -377,23 +371,6 @@ print(f"pair_weight     : {model.module.pair_weight}")
 print(f"align_on        : {model.module.align_on}")
 print(f"n_input genes   : {model.module.n_input}")
 
-if FINETUNE_MODEL_DIR is not None:
-    print(f"loading finetune initialization: {FINETUNE_MODEL_DIR!r}")
-    finetune_source = scvi.model.SCVI.load(FINETUNE_MODEL_DIR)
-    source_state = finetune_source.module.state_dict()
-    target_state = model.module.state_dict()
-    compatible_state = {
-        name: value
-        for name, value in source_state.items()
-        if name in target_state and target_state[name].shape == value.shape
-    }
-    skipped_state = sorted(set(source_state) - set(compatible_state))
-    model.module.load_state_dict(compatible_state, strict=False)
-    print(
-        f"✓ loaded {len(compatible_state)} matching parameter tensors; "
-        f"skipped {len(skipped_state)} incompatible tensors"
-    )
-
 model.train(
     max_epochs=MAX_EPOCHS,
     accelerator=TRAIN_ACCELERATOR,
@@ -401,24 +378,20 @@ model.train(
     plan_kwargs={"lr": LEARNING_RATE},
 )
 model.save(MODEL_DIR, overwrite=True, save_anndata=False)
-print(f"✓ saved model: {MODEL_DIR}")
-
+print(f"✓ stage-2 model saved: {MODEL_DIR}")
 
 # %%
 # ===== 8. latent 表示 =====
 SCVI_LATENT_KEY = "X_scVI"
 adata_subset.obsm[SCVI_LATENT_KEY] = model.get_latent_representation()
 
-
 # %%
 # ===== 9. 归一化表达（每细胞在自身 conditioning 下解码） =====
-# batch_key=None → 无 native batch effect，transform_batch 必须为 None
 X_norm = model.get_normalized_expression(
     lib_size=1e4,
     transform_batch=None,
 )
 adata_subset.layers["scvi_nrom_counts"] = X_norm
-
 
 # %%
 # ===== 10. 后验预测抽样 reconstructed counts =====
@@ -436,40 +409,24 @@ print(f"range: [{reconstructed.min()}, {reconstructed.max()}]  "
       f"median={np.median(reconstructed):.2f}")
 print(f"fraction non-zero: {(reconstructed > 0).mean():.3f}")
 
-# 稀疏 int 写入 layer
 adata_subset.layers["scvi_reconstructed_counts"] = to_sparse_int(reconstructed)
-# find zero genes
 
 # 持久化 AnnData + 模型
 adata_subset.write_h5ad(OUTBASE + ".h5ad", compression="gzip")
 print(f"✓ saved: {OUTBASE}.h5ad")
 
-
 # %%
-# ===== 10a. 切换到全部细胞：pair model + external decoder 一起跑全量 =====
-# 训练只在 CON 上做（避免 stress 信号污染 pair-MSE 梯度），但下游 encode
-# / decode / HKG dotplot 都要看 **全部 status** 的细胞。
-#
-# 实现方式：在 adata_eval 上重新登记 pair 模型的 manager（不复用 adata_subset
-# 上的那个 —— 它的 var 数量/索引虽然一致，但 obs 不同），然后让 pair model
-# 编码全量 adata_eval；后续 external-decode 块改为 adata_eval。
+# ===== 10a. 切换到全部细胞：pair model 在全量 adata_eval 上 encode/decode =====
 adata_eval = adata_all.copy()
 print(f"\n== full-data eval switch ==")
 print(f"adata_eval shape (all status): {adata_eval.shape}")
-# n_genes_on 已在 block 2 中以全量 (μ_all, σ_all) 算好并写入 adata_all，
-# 此处直接从共享 obs 列同步 dtype（adata_subset / adata_eval 是 view，
-# 但 .copy() 后 pandas 会丢失 float32 → 需手动恢复）。
 
-# 若 adata_eval 里有 NaN company，先丢弃以匹配训练分布
 eval_mask = adata_eval.obs[PAIR_BATCH_KEY].notna()
 if not bool(eval_mask.all()):
     adata_eval = adata_eval[eval_mask].copy()
     adata_eval.obs[PAIR_BATCH_KEY] = adata_eval.obs[PAIR_BATCH_KEY].astype("category")
 print(f"adata_eval after NaN drop : {adata_eval.shape}")
 
-# 强制 dtype，与训练子集保持一致
-# scvi-tools 的 _make_column_categorical 要求 Categorical dtype，
-# .copy() 后 object 列不会自动变 category，需在 eval 集上重转。
 for _cat_key in {PAIR_BATCH_KEY, LABELS_KEY}:
     adata_eval.obs[_cat_key] = adata_eval.obs[_cat_key].astype("category")
 if USE_CONT_COVS:
@@ -480,9 +437,7 @@ if USE_CONT_COVS:
         f"{adata_eval.obs['n_genes_on'].max():.3f}]"
     )
 
-# Pair model 已经在 adata_subset 上注册过 manager；要编码 adata_eval 必须
-# 先在 adata_eval 上注册一个独立的 manager。这里通过同一个 setup_anndata
-# 调用即可（scvi 会为新 adata 分配新的 manager UUID）。
+# 在 adata_eval 上注册 pair model 的独立 manager
 SCVIWithBatchPairLoss.setup_anndata(
     adata_eval,
     pair_batch_obs_key=PAIR_BATCH_KEY,
@@ -493,122 +448,18 @@ SCVIWithBatchPairLoss.setup_anndata(
 )
 print(f"  manager uuid (eval)     : {adata_eval.uns['_scvi_manager_uuid'][:8]}…")
 
-# 后续所有下游步骤（外部模型解码、HKG dotplot）都改在 adata_eval 上做。
-# 注意：保存 h5ad 时用 OUTBASE_FULL = <OUTBASE>_full.h5ad，避免覆盖训练子集 h5ad 不动。
 OUTBASE_FULL = OUTBASE + "_full"
 OUTDIR_FULL = os.path.dirname(OUTBASE_FULL) or "."
 os.makedirs(OUTDIR_FULL, exist_ok=True)
 
+# pair model 编码全部 status 的细胞
+z_pair = model.get_latent_representation(
+    adata=adata_eval, batch_size=512
+)
+adata_eval.obsm[SCVI_LATENT_KEY] = z_pair
 
 # %%
-# ===== 10b. External-decode：用另一份预训练 scVI 的 decoder 解码当前 pair z =====
-# 与 testbatchscvi.py 中的 "encode1" 块一致：加载一份独立训练好的 scVI，
-# 把当前 pair model 的 z 注入它的 generative inputs，得到：
-#   - <prefix>_counts     : 用该模型自己的 per-cell library 解码出的重建 counts
-#   - <prefix>_normlized  : 把 library 强制为 log(1e4) 解码的归一化表达
-# 通过 --external-model-dir 启用；默认关闭。
-# 本块改在 adata_eval（全量细胞）上跑：pair encoder 编码全部细胞 → 注入
-# external scVI decoder 解码。
-EXTERNAL_LIBRARY_SIZE = 1e4
-if DO_EXTERNAL_DECODE:
-    import torch as _torch  # noqa: F401  (already imported above, just clarifying)
-
-    print(f"== external-decode: loading scVI from {EXTERNAL_MODEL_DIR!r} ==")
-    external_model = scvi.model.SCVI.load(
-        EXTERNAL_MODEL_DIR, adata=adata_eval
-    )
-    print(f"external_model class         : {type(external_model).__name__}")
-    print(f"external_model.n_latent      : {external_model.module.n_latent}")
-    print(
-        f"external_model.use_observed_lib_size: "
-        f"{external_model.module.use_observed_lib_size}"
-    )
-
-    # 重新取一次 z_pair —— 这里必须用 adata_eval（全量）作为输入，让 pair
-    # encoder 编码全部 status 的细胞。pair model 已经用上面的 setup_anndata
-    # 在 adata_eval 上注册过 manager，get_latent_representation 可以直接跑。
-    z_pair = model.get_latent_representation(
-        adata=adata_eval, batch_size=512
-    )
-    adata_eval.obsm[SCVI_LATENT_KEY] = z_pair
-
-    # 单一 for 循环：每个 mini-batch 解码两次（一次 per-cell library → counts，
-    # 一次统一 library=1e4 → normalized），共享 encoder + 一次 generative forward
-    # 之外的额外一次 forward。
-    external_model.module.eval()
-    # adata_eval 已被 pair model 的 setup_anndata 注册过（携带其 scvi uuid），
-    # SCVI.load 内部的 manager 转移不会覆盖已有 uuid，导致 external 实例上
-    # 查不到 manager。这里显式 validate/transfer 一次，_make_data_loader 才能
-    # 找到 AnnDataManager。
-    external_model._validate_anndata(adata_eval)
-    ext_counts_list = []
-    ext_norm_list = []
-    with _torch.no_grad():
-        ext_loader = external_model._make_data_loader(
-            adata=adata_eval,
-            indices=np.arange(adata_eval.n_obs),
-            batch_size=512,
-            shuffle=False,
-        )
-        cell_start = 0
-        for tensors in ext_loader:
-            inf_in = external_model.module._get_inference_input(tensors)
-            inf_out = external_model.module.inference(**inf_in)
-            gen_in = external_model.module._get_generative_input(
-                tensors, inf_out
-            )
-
-            cell_stop = cell_start + tensors["X"].shape[0]
-            gen_in[MODULE_KEYS.Z_KEY] = _torch.as_tensor(
-                z_pair[cell_start:cell_stop],
-                dtype=inf_out[MODULE_KEYS.Z_KEY].dtype,
-                device=inf_out[MODULE_KEYS.Z_KEY].device,
-            )
-
-            # Counts: keep external model's per-cell library input.
-            gen_out = external_model.module.generative(**gen_in)
-            ext_counts_list.append(
-                gen_out[MODULE_KEYS.PX_KEY].mu.detach().cpu()
-            )
-
-            # Normalized: override library with log(1e4).
-            gen_in[MODULE_KEYS.LIBRARY_KEY] = _torch.full_like(
-                gen_in[MODULE_KEYS.LIBRARY_KEY],
-                float(np.log(EXTERNAL_LIBRARY_SIZE)),
-            )
-            gen_out_norm = external_model.module.generative(**gen_in)
-            ext_norm_list.append(
-                gen_out_norm[MODULE_KEYS.PX_KEY].mu.detach().cpu()
-            )
-            cell_start = cell_stop
-
-    ext_counts = _torch.cat(ext_counts_list, dim=0).numpy()
-    ext_norm = _torch.cat(ext_norm_list, dim=0).numpy().astype(np.float32)
-
-    counts_layer = f"{EXTERNAL_MODEL_PREFIX}_counts"
-    norm_layer = f"{EXTERNAL_MODEL_PREFIX}_normlized"
-    adata_eval.layers[counts_layer] = to_sparse_int(ext_counts)
-    adata_eval.layers[norm_layer] = csr_matrix(ext_norm)
-
-    print(
-        f"{counts_layer} shape : {ext_counts.shape}  "
-        f"range=[{ext_counts.min():.2f}, {ext_counts.max():.2f}]  "
-        f"median={np.median(ext_counts):.2f}"
-    )
-    print(
-        f"{norm_layer} shape: {ext_norm.shape}  "
-        f"range=[{ext_norm.min():.2f}, {ext_norm.max():.2f}]  "
-        f"library_size={EXTERNAL_LIBRARY_SIZE:g}"
-    )
-
-    # Re-persist with the new layers —— 写到 *_full.h5ad，保留训练子集 h5ad 不动。
-    adata_eval.write_h5ad(OUTBASE_FULL + ".h5ad", compression="gzip")
-    print(f"✓ re-saved: {OUTBASE_FULL}.h5ad  (with {counts_layer} / {norm_layer})")
-else:
-    print("⚠ external-decode: skipped (no --external-model-dir)")
-
-
-# %%
+# ===== HKG dotplots（全部在 adata_eval 上，pair model 解码） =====
 hkg_priority = [
     "Aars", "Sars",
     "Polr2a", "Polr2f",
@@ -636,8 +487,6 @@ for g in hkg_priority:
         hkg_genes.append(g)
 print(f"HKG available: {len(hkg_genes)} / {len(set(hkg_priority))}")
 
-# 画图分组列：优先 'sample'，没有则退化为 pair-batch 列。
-# status 分类顺序也只在 status 列存在时才设置。
 PLOT_GROUPBY = "sample" if "sample" in adata_eval.obs.columns else PAIR_BATCH_KEY
 if PLOT_GROUPBY != "sample":
     print(f"⚠ 'sample' not in obs: dotplot groupby falls back to {PLOT_GROUPBY!r}")
@@ -651,11 +500,7 @@ if SHOW_COMPARE:
     else:
         print("⚠ 'status' not in obs: skip status category ordering")
 
-# adata_eval 上的 reconstructed counts layer 是 pair model 在 adata_eval
-# 上重新抽样得到的（重新运行 posterior_predictive_sample 一次）。
-# 但训练子集 adata_subset 上已经写过一份 layer；为简化，这里直接跑一次
-# posterior_predictive_sample 到 adata_eval 上，覆盖写入同名的 layer。
-# 无论是否画图都执行，保证 h5ad 里始终有 scvi_reconstructed_counts。
+# pair model 在 adata_eval 上重新抽样 reconstructed counts
 recon_eval = model.posterior_predictive_sample(
     adata=adata_eval,
     n_samples=1,
@@ -729,46 +574,6 @@ if SHOW_COMPARE:
     fig_out = OUTBASE_FULL + ".count_diff.png"
     fig.savefig(fig_out, bbox_inches="tight", dpi=200)
     print(f"✓ saved: {fig_out}")
-
-    # ----- 可选：external-decode 层的 HKG dotplot -----
-    ext_counts_layer = f"{EXTERNAL_MODEL_PREFIX}_counts"
-    ext_norm_layer = f"{EXTERNAL_MODEL_PREFIX}_normlized"
-
-    if ext_counts_layer in adata_eval.layers:
-        fig = sc.pl.dotplot(
-            adata_eval,
-            var_names=hkg_genes,
-            groupby=PLOT_GROUPBY,
-            layer=ext_counts_layer,
-            cmap="Reds",
-            standard_scale=None,
-            swap_axes=False,
-            dendrogram=False,
-            return_fig=True,
-            show=False,
-            save="batchscvi_full_hkg_ext_counts.png",
-        )
-        fig_out = OUTBASE_FULL + f".hkg_{ext_counts_layer}.png"
-        fig.savefig(fig_out, bbox_inches="tight", dpi=200)
-        print(f"✓ saved: {fig_out}")
-
-    if ext_norm_layer in adata_eval.layers:
-        fig = sc.pl.dotplot(
-            adata_eval,
-            var_names=hkg_genes,
-            groupby=PLOT_GROUPBY,
-            layer=ext_norm_layer,
-            cmap="Reds",
-            standard_scale=None,
-            swap_axes=False,
-            dendrogram=False,
-            return_fig=True,
-            show=False,
-            save="batchscvi_full_hkg_ext_normlized.png",
-        )
-        fig_out = OUTBASE_FULL + f".hkg_{ext_norm_layer}.png"
-        fig.savefig(fig_out, bbox_inches="tight", dpi=200)
-        print(f"✓ saved: {fig_out}")
 else:
     print("⚠ --no-compare: skip HKG dotplots (and posterior_predictive_sample on eval set)")
 
