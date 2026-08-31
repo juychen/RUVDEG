@@ -24,23 +24,39 @@ OUT_ROOT="/data1st1/junyi/correctdata/transformed"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
 
-# Datasets to process (basename of <INPUT_DIR>/<name>.h5ad).
+# ---- 原多数据集配置（已注释，要恢复时取消下面注释，并注释掉上方单数据集配置）----
+#Datasets to process (basename of <INPUT_DIR>/<name>.h5ad).
 ALL_REGIONS=(GSE133549 GSE118767)
 
-# Per-dataset cell-type column name (must be same length as ALL_REGIONS).
+#Per-dataset cell-type column name (must be same length as ALL_REGIONS).
 CELLTYPE_KEYS=(nnet2 meta_cell_line_demuxlet)
 
-# Per-dataset pairing column (obs col used to build pairs; default 'company').
+#Per-dataset pairing column (obs col used to build pairs; default 'company').
 PAIR_BATCH_KEYS=(source_file protocol)
 
-# Per-dataset condition column. 'none' = no condition key.
-# batchScVI_v2.py falls back to training on ALL cells when there is no
-# condition key and no 'status' column, so public data can use 'none'.
+#Per-dataset condition column. 'none' = no condition key.
+#batchScVI_v2.py falls back to training on ALL cells when there is no
+#condition key and no 'status' column, so public data can use 'none'.
 CONDITION_KEYS=(none none)
 
-# Set to "--skip-stage1" to reuse existing <outbase>_scvi_nobatch.model
-# (stage-1 plain scVI) instead of retraining it every run.
-STAGE1_FLAG=""
+# ---- 当前配置：只跑 GSE118767 ----
+# # Datasets to process (basename of <INPUT_DIR>/<name>.h5ad).
+# ALL_REGIONS=(GSE118767)
+
+# # Per-dataset cell-type column name (must be same length as ALL_REGIONS).
+# CELLTYPE_KEYS=(meta_cell_line_demuxlet)
+
+# # Per-dataset pairing column (obs col used to build pairs; default 'company').
+# PAIR_BATCH_KEYS=(protocol)
+
+# # Per-dataset condition column. 'none' = no condition key.
+# # batchScVI_v2.py falls back to training on ALL cells when there is no
+# # condition key and no 'status' column, so public data can use 'none'.
+# CONDITION_KEYS=(none)
+
+# # Set to "--skip-stage1" to reuse existing <outbase>_scvi_nobatch.model
+# # (stage-1 plain scVI) instead of retraining it every run.
+# STAGE1_FLAG=""
 
 # ---- Model hyper-params (shared across datasets) ----
 N_LATENT=32

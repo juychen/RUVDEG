@@ -56,7 +56,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--batch-key",
-    action="store_true",default="company",
+    default="company",
     help="batch key（默认 company）",
 )
 
@@ -108,12 +108,12 @@ adata_subset = sc.read_h5ad(INPUT_H5AD)
 
 # transform_batch 必须是当前数据中实际存在的 company；缺失时使用细胞数最多的 company。
 if USE_BATCH:
-    if argparse.batch_key not in adata_subset.obs.columns:
+    if args.batch_key not in adata_subset.obs.columns:
         raise KeyError("使用 batch 校正时，adata.obs 必须包含 batch_key 列")
 
-    company_counts = adata_subset.obs[argparse.batch_key].dropna().astype(str).value_counts()
+    company_counts = adata_subset.obs[args.batch_key].dropna().astype(str).value_counts()
     if company_counts.empty:
-        raise ValueError(f"adata.obs['{argparse.batch_key}'] 没有有效值，无法选择 transform_batch")
+        raise ValueError(f"adata.obs['{args.batch_key}'] 没有有效值，无法选择 transform_batch")
 
     if TRANSFORM_BATCH not in company_counts.index:
         requested_transform_batch = TRANSFORM_BATCH
@@ -168,7 +168,7 @@ adata_subset.X = adata_subset.layers["counts"].copy()
 
 # --no-batch 时 BATCH_KEY=None：scvi 不注册 batch 字段，模型完全不使用 batch
 # --no-cont-cov 时 CONT_COVS=None：scvi 不注册任何连续协变量
-BATCH_KEY = argparse.batch_key if USE_BATCH else None
+BATCH_KEY = args.batch_key if USE_BATCH else None
 CONT_COVS = ["n_genes_on"] if USE_CONT_COVS else None
 
 scvi.model.SCVI.setup_anndata(
