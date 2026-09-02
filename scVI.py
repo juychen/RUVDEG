@@ -324,7 +324,7 @@ if USE_BATCH:
 # %%
 
 if USE_BATCH:
-    batch_map = dict(zip(adata_subset.obs['company'].values, adata_subset.obs['batch_idx'].values))
+    batch_map = dict(zip(adata_subset.obs[args.batch_key].values, adata_subset.obs['batch_idx'].values))
 
 # %%
 if USE_BATCH:

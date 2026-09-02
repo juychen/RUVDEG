@@ -38,24 +38,25 @@ from sklearn.metrics import roc_auc_score
 
 # ----------------------------- defaults / constants -----------------------------
 HK_PRIORITY = [
-    # 结构/骨架
-    "Actb", "Tuba1a", "Ubc", "Uba52",
+    # 结构/骨架 (mouse + human symbols; human panels use uppercase)
+    "Actb", "ACTB", "Tuba1a", "TUBA1A", "Tuba1b", "TUBA1B",
+    "Ubc", "UBC", "Uba52", "UBA52",
     # 蛋白酶体/折叠
-    "Psmd6", "Psmd7", "Psma5",
-    "Hsp90aa1", "Hsp90ab1",
-    "Ywhaz",
+    "Psmd6", "PSMD6", "Psmd7", "PSMD7", "Psma5", "PSMA5",
+    "Hsp90aa1", "HSP90AA1", "Hsp90ab1", "HSP90AB1",
+    "Ywhaz", "YWHAZ",
     # 线粒体
-    "Sdha", "Cyc1",
-    "Cox4i1", "Cox5b",
-    "Ndufb8",
-    "Atp5f1b",
+    "Sdha", "SDHA", "Cyc1", "CYC1",
+    "Cox4i1", "COX4I1", "Cox5b", "COX5B",
+    "Ndufb8", "NDUFB8",
+    "Atp5f1b", "ATP5F1B",
     # 翻译/转录
-    "Eef1a1",
-    "Rplp0", "Rpl19", "Rps18",
-    "Polr2a",
-    "Tbp",
+    "Eef1a1", "EEF1A1",
+    "Rplp0", "RPLP0", "Rpl19", "RPL19", "Rps18", "RPS18",
+    "Polr2a", "POLR2A",
+    "Tbp", "TBP",
     # 代谢
-    "Ppia", "Pgk1",
+    "Ppia", "PPIA", "Pgk1", "PGK1",
 ]
 
 
@@ -183,6 +184,13 @@ def compute_hkg_auc(ad_con):
     X_corr = np.asarray(X_corr)
 
     hkg_in = [g for g in HK_PRIORITY if g in ad_con.var_names]
+    # Also look up HK genes via an alternate var column (e.g. 'gene_symbol')
+    # when var_names are Ensembl IDs.
+    if not hkg_in and "gene_symbol" in getattr(ad_con, "var", pd.DataFrame()).columns:
+        sym_to_idx = {s: i for i, s in enumerate(ad_con.var["gene_symbol"].astype(str).values)}
+        hkg_in = [g for g in HK_PRIORITY if g in sym_to_idx]
+        if hkg_in:
+            print(f"[INFO] HK matched via adata.var['gene_symbol'] (Ensembl var_names)")
     print(f"[INFO] HK priority has {len(HK_PRIORITY)} genes, "
           f"{len(hkg_in)} present in adata")
     print(f"[INFO] companies: {companies}")
@@ -190,8 +198,18 @@ def compute_hkg_auc(ad_con):
           f"{dict(zip(*np.unique(con_company, return_counts=True)))}")
 
     rows = []
+    var_name_to_col = {str(n): i for i, n in enumerate(ad_con.var_names)}
+    sym_to_col = None
+    if "gene_symbol" in getattr(ad_con, "var", pd.DataFrame()).columns:
+        sym_to_col = {str(s): i for i, s in enumerate(ad_con.var["gene_symbol"].astype(str).values)}
     for g in hkg_in:
-        col = list(ad_con.var_names).index(g)
+        if g in var_name_to_col:
+            col = var_name_to_col[g]
+        elif sym_to_col is not None and g in sym_to_col:
+            col = sym_to_col[g]
+        else:
+            # gene not findable in this AnnData; skip silently
+            continue
         raw_a = per_company_aucs(X_raw[:, col], con_company, companies)
         cor_a = per_company_aucs(X_corr[:, col], con_company, companies)
         for comp in companies:
@@ -238,14 +256,20 @@ def compute_top10_auc(df_raw_filtered, ad_con, top_n):
     X_corr = np.asarray(X_corr)
 
     var_index = {g: i for i, g in enumerate(ad_con.var_names)}
+    sym_index = None
+    if "gene_symbol" in getattr(ad_con, "var", pd.DataFrame()).columns:
+        sym_index = {str(s): i for i, s in enumerate(ad_con.var["gene_symbol"].astype(str).values)}
     rows = []
     for company, comp_df in top10.items():
         y_company = (con_company == company).astype(int)
         for _, gene_row in comp_df.iterrows():
             gene = str(gene_row["names"])
-            if gene not in var_index:
+            if gene in var_index:
+                col = var_index[gene]
+            elif sym_index is not None and gene in sym_index:
+                col = sym_index[gene]
+            else:
                 continue
-            col = var_index[gene]
             raw_auc = abs(roc_auc_score(y_company, X_raw[:, col]) - 0.5) + 0.5
             corr_auc = abs(roc_auc_score(y_company, X_corr[:, col]) - 0.5) + 0.5
             rows.append({

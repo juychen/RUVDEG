@@ -11,8 +11,8 @@ set -euo pipefail
 
 # ---- Config (edit here) ----
 SCRIPT="/home/junyichen/code/RUVAEDEG/scviHarmony.py"
-INPUT_DIRS=(/data1st1/junyi/correctdata/publicdata)
-OUT_ROOT="/data1st1/junyi/correctdata/transformed"
+INPUT_DIRS=(/data8/junyi/pubdata/publicdata)
+OUT_ROOT="/data8/junyi/pubdata/transformed"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
 NCLUST="5"
@@ -22,7 +22,7 @@ HARMONY_BATCH=("protocol" "source_file")
 LAMB=0.3
 MAX_ITER_HARMONY=20
 
-#ALL_REGIONS=(GSE118767 GSE133549)
+#ALL_REGIONS=(GSE133549)
 ALL_REGIONS=(GSE118767 GSE133549)
 
 # ---- Optional conda env ----

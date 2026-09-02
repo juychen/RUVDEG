@@ -19,8 +19,8 @@ set -euo pipefail
 
 # ---- Config (edit here) ----
 SCRIPT="/home/junyichen/code/RUVAEDEG/batchScVI_v2.py"
-INPUT_DIRS=(/data1st1/junyi/correctdata/publicdata)
-OUT_ROOT="/data1st1/junyi/correctdata/transformed"
+INPUT_DIRS=(/data8/junyi/pubdata/publicdata)
+OUT_ROOT="/data8/junyi/pubdata/transformed"
 MAX_JOBS=4
 CONDA_ENV="scvi-env"          # empty = use current python
 

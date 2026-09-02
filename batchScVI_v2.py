@@ -9,14 +9,15 @@ Stage 1 (mirror of scVI.py --no-batch):
     is ever needed.
 
 Stage 2 (mirror of batchScVI.py):
-    Train ``SCVIWithBatchPairLoss`` (pair-MSE alignment) on the same adata
-    to minimize batch difference on top of the stage-1 baseline.
+    Initialize ``SCVIWithBatchPairLoss`` from stage-1 and train with pair-MSE
+    alignment to update the latent representation.
 
 Outputs (all written under the same ``--outprefix``):
     <outbase>_scvi_nobatch.model/   stage-1 plain scVI checkpoint
     <outbase>.h5ad                  pair-model results (CON subset)
     <outbase>.model/                stage-2 pair model checkpoint
-    <outbase>_full.h5ad             full-data (all status) results
+    <outbase>_full.h5ad             full-data results; updated pair Z decoded
+                                    with the stage-1 RAW scVI decoder
     <outbase>_full.hkg_*.png        HKG dotplots
 """
 
@@ -32,6 +33,7 @@ import seaborn as sns
 import torch
 from rich import print
 from scipy.sparse import csr_matrix, issparse
+from scvi.module._constants import MODULE_KEYS
 
 
 def to_sparse_int(arr, dtype=np.int32):
@@ -49,6 +51,57 @@ def to_sparse_int(arr, dtype=np.int32):
         result = result.astype(dtype)
     result.eliminate_zeros()
     return result
+
+
+def decode_with_fixed_latent(model, adata, z, batch_size=512, lib_size=1e4):
+    """Decode fixed latent values with a trained scVI decoder."""
+    z = np.asarray(z)
+    model._validate_anndata(adata)
+    model.module.eval()
+    counts_list = []
+    normalized_list = []
+
+    with torch.no_grad():
+        loader = model._make_data_loader(
+            adata=adata,
+            indices=np.arange(adata.n_obs),
+            batch_size=batch_size,
+            shuffle=False,
+        )
+        cell_start = 0
+        for tensors in loader:
+            inference_input = model.module._get_inference_input(tensors)
+            inference_outputs = model.module.inference(**inference_input)
+            generative_inputs = model.module._get_generative_input(
+                tensors, inference_outputs
+            )
+
+            cell_stop = cell_start + tensors["X"].shape[0]
+            generative_inputs[MODULE_KEYS.Z_KEY] = torch.as_tensor(
+                z[cell_start:cell_stop],
+                dtype=inference_outputs[MODULE_KEYS.Z_KEY].dtype,
+                device=inference_outputs[MODULE_KEYS.Z_KEY].device,
+            )
+
+            counts_output = model.module.generative(**generative_inputs)
+            counts_list.append(
+                counts_output[MODULE_KEYS.PX_KEY].mu.detach().cpu()
+            )
+
+            generative_inputs[MODULE_KEYS.LIBRARY_KEY] = torch.full_like(
+                generative_inputs[MODULE_KEYS.LIBRARY_KEY],
+                float(np.log(lib_size)),
+            )
+            normalized_output = model.module.generative(**generative_inputs)
+            normalized_list.append(
+                normalized_output[MODULE_KEYS.PX_KEY].mu.detach().cpu()
+            )
+            cell_start = cell_stop
+
+    return (
+        torch.cat(counts_list, dim=0).numpy(),
+        torch.cat(normalized_list, dim=0).numpy().astype(np.float32),
+    )
 
 
 # ===== 命令行参数 =====
@@ -301,6 +354,7 @@ CONT_COVS = ["n_genes_on"] if USE_CONT_COVS else None
 # 完全同源 —— 不需要任何 external model 加载 / 基因对齐。
 if SKIP_STAGE1 and os.path.isdir(STAGE1_MODEL_DIR):
     print(f"== stage-1 skipped (--skip-stage1): {STAGE1_MODEL_DIR} ==")
+    stage1_model = scvi.model.SCVI.load(STAGE1_MODEL_DIR)
 else:
     print(f"\n== stage-1: plain scVI (nobatch) on {adata_subset.shape} ==")
     # 用独立副本注册，避免与 stage-2 的 pair model manager 互相覆盖 uuid
@@ -338,7 +392,6 @@ else:
 # ============================================================
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model_scvi_batch_pair import SCVIWithBatchPairLoss  # noqa: E402
-from scvi.module._constants import MODULE_KEYS  # noqa: E402
 
 print(f"\n== stage-2: SCVIWithBatchPairLoss on {adata_subset.shape} ==")
 
@@ -365,6 +418,21 @@ model = SCVIWithBatchPairLoss(
     pair_weight=PAIR_WEIGHT,
     align_on=ALIGN_ON,
     deeply_inject_covariates=False,  # decoder 不看 pair-batch
+)
+
+# Start pair-loss training from the RAW scVI solution so the second model
+# updates the RAW latent representation instead of learning independently.
+source_state = stage1_model.module.state_dict()
+target_state = model.module.state_dict()
+compatible_state = {
+    name: value
+    for name, value in source_state.items()
+    if name in target_state and target_state[name].shape == value.shape
+}
+model.module.load_state_dict(compatible_state, strict=False)
+print(
+    f"✓ initialized stage-2 from stage-1: "
+    f"{len(compatible_state)} compatible parameter tensors"
 )
 print(f"module class    : {type(model.module).__name__}")
 print(f"pair_weight     : {model.module.pair_weight}")
@@ -421,6 +489,9 @@ adata_eval = adata_all.copy()
 print(f"\n== full-data eval switch ==")
 print(f"adata_eval shape (all status): {adata_eval.shape}")
 
+# The RAW decoder was trained on counts, so evaluation must use the same X.
+adata_eval.X = adata_eval.layers["counts"].copy()
+
 eval_mask = adata_eval.obs[PAIR_BATCH_KEY].notna()
 if not bool(eval_mask.all()):
     adata_eval = adata_eval[eval_mask].copy()
@@ -457,6 +528,28 @@ z_pair = model.get_latent_representation(
     adata=adata_eval, batch_size=512
 )
 adata_eval.obsm[SCVI_LATENT_KEY] = z_pair
+
+# Decode the updated pair-loss Z with the original RAW scVI decoder.
+adata_eval_raw = adata_eval.copy()
+scvi.model.SCVI.setup_anndata(
+    adata_eval_raw,
+    layer=None,
+    batch_key=None,
+    labels_key=None,
+    categorical_covariate_keys=None,
+    continuous_covariate_keys=CONT_COVS,
+)
+raw_scvi_decoder = scvi.model.SCVI.load(
+    STAGE1_MODEL_DIR,
+    adata=adata_eval_raw,
+)
+raw_counts, raw_normalized = decode_with_fixed_latent(
+    raw_scvi_decoder,
+    adata_eval_raw,
+    z_pair,
+)
+adata_eval.layers["scvi_reconstructed_counts"] = to_sparse_int(raw_counts)
+adata_eval.layers["scvi_nrom_counts"] = csr_matrix(raw_normalized)
 
 # %%
 # ===== HKG dotplots（全部在 adata_eval 上，pair model 解码） =====
@@ -499,17 +592,6 @@ if SHOW_COMPARE:
         )
     else:
         print("⚠ 'status' not in obs: skip status category ordering")
-
-# pair model 在 adata_eval 上重新抽样 reconstructed counts
-recon_eval = model.posterior_predictive_sample(
-    adata=adata_eval,
-    n_samples=1,
-    batch_size=512,
-    transform_batch=None,
-    silent=False,
-)
-recon_eval = np.asarray(recon_eval.todense())
-adata_eval.layers["scvi_reconstructed_counts"] = to_sparse_int(recon_eval)
 
 if SHOW_COMPARE:
     recon = adata_eval.layers["scvi_reconstructed_counts"]
