@@ -34,9 +34,10 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # (subdir key, display label) — display order is fixed across all plots.
 METHODS: list[tuple[str, str]] = [
-    ("batchscvi", "scVI-batch"),
-    ("scVInobatch", "scVI"),
+    ("scVI", "scVI"),
+    ("scVInobatch", "scVI no-batch"),
     ("scviharmony", "scVI-Harmony"),
+    ("batchscvi", "scVI-batch"),
 ]
 
 DATASETS: list[tuple[str, str]] = [
@@ -46,9 +47,10 @@ DATASETS: list[tuple[str, str]] = [
 
 # Categorical palette — fixed order, identity (never cycled).
 PALETTE: dict[str, str] = {
-    "scVI-batch": "#2ca02c",      # green
-    "scVI": "#1f77b4",            # blue
+    "scVI": "#7f7f7f",            # gray  (baseline)
+    "scVI no-batch": "#1f77b4",   # blue
     "scVI-Harmony": "#ff7f0e",    # orange
+    "scVI-batch": "#2ca02c",      # green  (best expected)
 }
 
 DISTANCE_METRICS: list[tuple[str, str]] = [
