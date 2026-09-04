@@ -333,6 +333,74 @@ def _cross_batch_pair_mse(
     return pair_loss, int(total_pairs.item())
 
 
+def _fixed_reference_pair_mse(
+    x: torch.Tensor,
+    reference_x: torch.Tensor,
+    cell_type_idx: torch.Tensor | None = None,
+    reference_cell_type_idx: torch.Tensor | None = None,
+    reduce: str = "sum",
+) -> tuple[torch.Tensor, int]:
+    """Mean squared distance over every current/reference cell pair.
+
+    The loss uses the exact Cartesian product of cells in matching cell-type
+    groups. It does not replace either set with a centroid. ``reduce`` mirrors
+    the legacy cross-batch pair loss: ``"sum"`` divides only by the number of
+    cell-cell pairs (so magnitudes are comparable with V1/V2/V3's
+    ``batch_pair_mse``); ``"mean"`` further divides by ``x.shape[1]``.
+    """
+    if reduce not in {"mean", "sum"}:
+        raise ValueError(f"reduce must be 'mean' or 'sum', got {reduce!r}")
+    if x.ndim != 2 or reference_x.ndim != 2:
+        raise ValueError("x and reference_x must both be two-dimensional")
+    if x.shape[1] != reference_x.shape[1]:
+        raise ValueError(
+            "x and reference_x must have the same feature dimension; "
+            f"got {x.shape[1]} and {reference_x.shape[1]}"
+        )
+    if reference_x.shape[0] == 0:
+        return x.new_zeros(()), 0
+
+    if cell_type_idx is None or reference_cell_type_idx is None:
+        groups = [(x, reference_x)]
+    else:
+        cell_type_idx = cell_type_idx.view(-1)
+        reference_cell_type_idx = reference_cell_type_idx.view(-1)
+        if cell_type_idx.shape[0] != x.shape[0]:
+            raise ValueError("cell_type_idx does not match x")
+        if reference_cell_type_idx.shape[0] != reference_x.shape[0]:
+            raise ValueError("reference_cell_type_idx does not match reference_x")
+        groups = []
+        for group in torch.unique(
+            torch.cat([cell_type_idx, reference_cell_type_idx])
+        ):
+            current_group = x[cell_type_idx == group]
+            reference_group = reference_x[reference_cell_type_idx == group]
+            if current_group.shape[0] and reference_group.shape[0]:
+                groups.append((current_group, reference_group))
+
+    total_squared_distance = x.new_zeros(())
+    total_pairs = 0
+    for current_group, reference_group in groups:
+        n_current = current_group.shape[0]
+        n_reference = reference_group.shape[0]
+        total_squared_distance = total_squared_distance + (
+            n_reference * current_group.square().sum()
+            + n_current * reference_group.square().sum()
+            - 2
+            * current_group.sum(dim=0).dot(reference_group.sum(dim=0))
+        )
+        total_pairs += n_current * n_reference
+
+    if total_pairs == 0:
+        return x.new_zeros(()), 0
+    if reduce == "sum":
+        return total_squared_distance / total_pairs, total_pairs
+    if reduce == "mean":
+        total_squared_distance = total_squared_distance / x.shape[1]
+        return total_squared_distance / total_pairs, total_pairs
+    raise ValueError(f"reduce must be 'mean' or 'sum', got {reduce!r}")
+
+
 class VAEWithBatchPairLoss(VAE):
     """VAE module that adds a cross-batch MSE alignment loss.
 
@@ -511,6 +579,148 @@ class SCVIWithBatchPairLoss(SCVI):
             categorical_covariate_keys=cat_covs,
             **kwargs,
         )
+
+
+class VAEWithFixedReferencePairLoss(VAE):
+    """VAE with a fixed stage-1 reference embedding pair loss."""
+
+    def __init__(
+        self,
+        *args,
+        fixed_reference_n: int = 0,
+        fixed_pair_weight: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if fixed_reference_n < 0:
+            raise ValueError("fixed_reference_n must be non-negative")
+        if fixed_pair_weight < 0:
+            raise ValueError("fixed_pair_weight must be non-negative")
+        self.fixed_pair_weight = float(fixed_pair_weight)
+        self.register_buffer(
+            "fixed_reference_latent",
+            torch.zeros(int(fixed_reference_n), self.n_latent),
+        )
+        self.register_buffer(
+            "fixed_reference_cell_type",
+            torch.full((int(fixed_reference_n),), -1, dtype=torch.long),
+        )
+
+    def set_fixed_reference(
+        self,
+        reference_latent: torch.Tensor,
+        reference_cell_type: torch.Tensor | None = None,
+    ) -> None:
+        """Copy stage-1 reference values into non-trainable module buffers."""
+        reference_latent = torch.as_tensor(
+            reference_latent,
+            dtype=self.fixed_reference_latent.dtype,
+            device=self.fixed_reference_latent.device,
+        )
+        if reference_latent.shape != self.fixed_reference_latent.shape:
+            raise ValueError(
+                "reference_latent has the wrong shape; "
+                f"got {tuple(reference_latent.shape)}, expected "
+                f"{tuple(self.fixed_reference_latent.shape)}"
+            )
+        self.fixed_reference_latent.copy_(reference_latent)
+
+        if reference_cell_type is None:
+            self.fixed_reference_cell_type.fill_(-1)
+            return
+        reference_cell_type = torch.as_tensor(
+            reference_cell_type,
+            dtype=torch.long,
+            device=self.fixed_reference_cell_type.device,
+        ).view(-1)
+        if reference_cell_type.shape != self.fixed_reference_cell_type.shape:
+            raise ValueError(
+                "reference_cell_type has the wrong shape; "
+                f"got {tuple(reference_cell_type.shape)}, expected "
+                f"{tuple(self.fixed_reference_cell_type.shape)}"
+            )
+        self.fixed_reference_cell_type.copy_(reference_cell_type)
+
+    def loss(
+        self,
+        tensors: dict[str, torch.Tensor],
+        inference_outputs: dict[str, torch.Tensor | None],
+        generative_outputs: dict[str, torch.Tensor | None],
+        kl_weight: torch.Tensor | float = 1.0,
+    ) -> LossOutput:
+        """scVI loss plus pairwise distance to fixed stage-1 embeddings."""
+        loss_output = super().loss(
+            tensors, inference_outputs, generative_outputs, kl_weight
+        )
+        if self.fixed_pair_weight == 0.0:
+            return loss_output
+
+        x = inference_outputs[MODULE_KEYS.Z_KEY]
+        reference_x = self.fixed_reference_latent.to(
+            device=x.device, dtype=x.dtype
+        )
+        current_cell_type = tensors.get(REGISTRY_KEYS.LABELS_KEY, None)
+        if self.fixed_reference_cell_type.numel() == 0:
+            reference_cell_type = None
+        elif bool((self.fixed_reference_cell_type < 0).all()):
+            reference_cell_type = None
+        else:
+            reference_cell_type = self.fixed_reference_cell_type.to(x.device)
+        if current_cell_type is not None:
+            current_cell_type = current_cell_type.long().view(-1)
+
+        pair_loss, n_pairs = _fixed_reference_pair_mse(
+            x,
+            reference_x,
+            cell_type_idx=current_cell_type,
+            reference_cell_type_idx=reference_cell_type,
+            reduce="sum",
+        )
+        if n_pairs > 0:
+            loss_output.loss = (
+                loss_output.loss + self.fixed_pair_weight * pair_loss
+            )
+        if loss_output.extra_metrics is None:
+            loss_output.extra_metrics = {}
+        loss_output.extra_metrics["fixed_batch_pair_mse"] = float(
+            pair_loss.detach().cpu()
+        )
+        loss_output.extra_metrics["fixed_batch_pair_n"] = int(n_pairs)
+        return loss_output
+
+
+class SCVIWithFixedReferencePairLoss(SCVI):
+    """SCVI with a new loss against frozen stage-1 reference embeddings."""
+
+    _module_cls = VAEWithFixedReferencePairLoss
+
+    def __init__(
+        self,
+        adata=None,
+        registry=None,
+        *args,
+        fixed_reference_n: int = 0,
+        fixed_pair_weight: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(
+            adata,
+            registry,
+            *args,
+            fixed_reference_n=fixed_reference_n,
+            fixed_pair_weight=fixed_pair_weight,
+            **kwargs,
+        )
+        self.fixed_reference_n = int(fixed_reference_n)
+        self.fixed_pair_weight = float(fixed_pair_weight)
+
+    def set_fixed_reference(
+        self,
+        reference_latent: torch.Tensor,
+        reference_cell_type: torch.Tensor | None = None,
+    ) -> None:
+        """Set the frozen stage-1 embedding used by the added loss."""
+        self.module.set_fixed_reference(reference_latent, reference_cell_type)
 
 
 # =========================================================================
