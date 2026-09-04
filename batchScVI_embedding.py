@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from model_scvi_batch_pair import CelltypeBatchStratifiedSampler
 from model_scvi_batch_pair_embedding import UVEmbeddingModel
+from scvi.model._utils import get_max_epochs_heuristic
 
 
 parser = argparse.ArgumentParser(
@@ -50,7 +51,11 @@ parser.add_argument("--pair-weight", type=float, default=1.0)
 parser.add_argument("--reconstruction-weight", type=float, default=1.0)
 parser.add_argument("--delta-penalty", type=float, default=1e-3)
 parser.add_argument("--lr", type=float, default=1e-3)
-parser.add_argument("--max-epochs", type=int, default=100)
+parser.add_argument(
+    "--max-epochs", type=int, default=None,
+    help="maximum training epochs; None uses scVI automatic epoch selection "
+    "(get_max_epochs_heuristic, cap=400)",
+)
 parser.add_argument("--batch-size", type=int, default=512)
 parser.add_argument("--min-cells-per-group", type=int, default=2)
 parser.add_argument("--skip-stage1", action="store_true")
@@ -337,6 +342,10 @@ print(f"uv_dim            : {args.uv_dim}")
 print(f"pair_weight       : {args.pair_weight}")
 print(f"reconstruction_weight: {args.reconstruction_weight}")
 print(f"delta_penalty     : {args.delta_penalty}")
+print(f"max_epochs        : {args.max_epochs} (None -> scVI heuristic, cap=400)")
+print(f"lr                : {args.lr}")
+print(f"n_latent          : {args.n_latent}")
+print(f"n_layers          : {args.n_layers}")
 
 adata_all, adata_train, pair_labels_key = prepare_data()
 CONT_COVS = ["n_genes_on"] if USE_CONT_COVS else None
@@ -398,7 +407,15 @@ train_loader = sampler
 optimizer = torch.optim.Adam(uv_model.parameters(), lr=args.lr)
 
 history = []
-for epoch in range(args.max_epochs):
+if args.max_epochs is None:
+    max_epochs = get_max_epochs_heuristic(len(z_train))
+    print(
+        f"max_epochs not provided; using scVI heuristic: {max_epochs} "
+        f"epochs (n_train={len(z_train)})"
+    )
+else:
+    max_epochs = args.max_epochs
+for epoch in range(max_epochs):
     uv_model.train()
     epoch_metrics = []
     for batch_indices in train_loader:

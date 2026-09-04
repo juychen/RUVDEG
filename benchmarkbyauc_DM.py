@@ -237,6 +237,78 @@ def summarize_distance_by_celltype_batch(long_df: pd.DataFrame):
         pivot["delta_corr_minus_raw"] = pivot["corr"] - pivot["raw"]
     return summary, pivot
 
+
+# ----------------------------- UMAP plotting -----------------------------
+def _pick_umap_rep(adata, preferred: str | None = None) -> str:
+    """Pick a representation key for UMAP, mirroring umap.ipynb convention.
+
+    Priority: explicit ``preferred`` (if present in adata.obsm), else
+    X_harmony > X_scVI > X_scVI_* > X_pca > first available key.
+    """
+    if preferred and preferred in adata.obsm:
+        return preferred
+    for key in ["X_harmony", "X_scVI", "X_pca"]:
+        if key in adata.obsm:
+            return key
+    scvi_like = [k for k in adata.obsm if k.startswith("X_scVI")]
+    if scvi_like:
+        return scvi_like[0]
+    raise KeyError(
+        f"No suitable obsm key for UMAP. Tried {[preferred] if preferred else []}"
+        f"+ ['X_harmony', 'X_scVI', 'X_pca']. "
+        f"Available: {list(adata.obsm.keys())}")
+
+
+def draw_umap(
+    adata,
+    out_path: Path,
+    celltype_key: str = "celltype.L2",
+    batch_key: str = "company",
+    rep: str | None = None,
+    extra_color_keys: list[str] | None = None,
+):
+    """Compute neighbours + UMAP on a latent rep and save a PNG.
+
+    Mirrors the loop in ``umap.ipynb``: neighbors → umap → pl.umap with
+    ``show=False`` and ``save=...``. Colours are celltype, batch, and any
+    extra obs columns that exist (e.g. ``status``).
+    """
+    rep = _pick_umap_rep(adata, preferred=rep)
+    print(f"[INFO] UMAP: using rep={rep!r}, shape={adata.obsm[rep].shape}")
+
+    sc.pp.neighbors(adata, use_rep=rep)
+    sc.tl.umap(adata)
+
+    color_keys: list[str] = []
+    if celltype_key in adata.obs.columns:
+        color_keys.append(celltype_key)
+    if batch_key in adata.obs.columns:
+        color_keys.append(batch_key)
+    if "status" in adata.obs.columns:
+        color_keys.append("status")
+    for k in extra_color_keys or []:
+        if k in adata.obs.columns and k not in color_keys:
+            color_keys.append(k)
+
+    if not color_keys:
+        raise KeyError(
+            "UMAP: no usable obs columns found for colouring. "
+            f"Requested celltype_key={celltype_key!r}, batch_key={batch_key!r}. "
+            f"Available obs: {adata.obs.columns.tolist()}")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    save_name = out_path.stem  # scanpy appends `_umap.png` automatically
+    print(f"[INFO] UMAP: plotting {color_keys} → {out_path}")
+    sc.pl.umap(adata, color=color_keys, save=save_name, show=False)
+    # scanpy saves to ./figures/<save_name>_umap.png by default; relocate it
+    # so the caller gets exactly the path they asked for.
+    default_saved = Path("figures") / f"{save_name}_umap.png"
+    if default_saved.exists() and default_saved.resolve() != out_path.resolve():
+        out_path.write_bytes(default_saved.read_bytes())
+        default_saved.unlink()
+    print(f"[INFO] UMAP saved to {out_path}")
+
 # ----------------------------- entry point -----------------------------
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
@@ -263,6 +335,17 @@ def parse_args():
                    help="Subset adata to cells with this value in "
                         "adata.obs['Model'] before the distance benchmark "
                         "(e.g. 'CON_M'). Empty = no filter.")
+    p.add_argument("--umap-out", type=Path, default=None,
+                   help="If set, draw a UMAP of the latent representation "
+                        "(neighbors → umap → pl.umap) and save to this PNG path. "
+                        "Follows the umap.ipynb convention: rep is auto-picked "
+                        "from X_harmony > X_scVI > X_pca unless --umap-rep is given.")
+    p.add_argument("--umap-rep", type=str, default=None,
+                   help="Explicit obsm key for UMAP (e.g. 'X_scVI', 'X_harmony'). "
+                        "Overrides auto-detection.")
+    p.add_argument("--umap-color", action="append", default=None,
+                   help="Extra obs column(s) to colour the UMAP by "
+                        "(e.g. --umap-color status). May be passed multiple times.")
     return p.parse_args()
 
 
@@ -329,6 +412,16 @@ def main():
 
     print("\n=== celltype × batch_pair × metric: raw vs corr (mean_d) ===")
     print(ct_pivot.round(4).to_string(index=False))
+
+    if args.umap_out is not None:
+        draw_umap(
+            adata,
+            out_path=args.umap_out,
+            celltype_key=args.celltype_key,
+            batch_key=args.batch_key,
+            rep=args.umap_rep,
+            extra_color_keys=args.umap_color,
+        )
 
 
 if __name__ == "__main__":
