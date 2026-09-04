@@ -132,10 +132,42 @@ def _safe_hellinger(a, b, bins=50):
     return float(np.linalg.norm(np.sqrt(pa) - np.sqrt(pb)) / np.sqrt(2))
 
 
+def _safe_mean_abs_cross_diff(a, b):
+    """Mean absolute difference over the Cartesian product of two cell sets.
+
+    ``mean_diff`` is now ``mean_{i in a, j in b} |a_i - b_j|`` (exact cell
+    pair differences) instead of ``|mean(a) - mean(b)|``.  Naive O(nA*nB)
+    pairwise evaluation is replaced by a sort + prefix-sum identity:
+
+        sum_j |a_i - b_j| =
+            (# b <= a_i) * a_i - sum(b <= a_i)
+            + (sum(b > a_i) - #(b > a_i) * a_i)
+
+    which gives the exact same result in O((nA+nB) log(nA+nB)) time.
+    """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.size == 0 or b.size == 0:
+        return np.nan
+    a = np.sort(a)
+    b = np.sort(b)
+    # Prefix sums of b allow O(1) lookups of sum(b <= threshold).
+    b_cum = np.concatenate([[0.0], np.cumsum(b)])
+    total_abs = 0.0
+    for a_i in a:
+        k = int(np.searchsorted(b, a_i, side="right"))
+        le_sum = b_cum[k]            # sum of b_j <= a_i
+        gt_sum = b_cum[-1] - le_sum  # sum of b_j >  a_i
+        le_cnt = k
+        gt_cnt = b.size - k
+        total_abs += (le_cnt * a_i - le_sum) + (gt_sum - gt_cnt * a_i)
+    return float(total_abs / (a.size * b.size))
+
+
 def _one_pair_metrics(a, b):
     a = np.asarray(a); b = np.asarray(b)
     return {
-        "mean_diff":   float(abs(a.mean() - b.mean())),
+        "mean_diff":   _safe_mean_abs_cross_diff(a, b),
         "cohens_d":    _safe_cohens_d(a, b),
         "var_ratio":   _safe_var_ratio(a, b),
         "hellinger":   _safe_hellinger(a, b),
@@ -336,10 +368,11 @@ def parse_args():
                         "adata.obs['Model'] before the distance benchmark "
                         "(e.g. 'CON_M'). Empty = no filter.")
     p.add_argument("--umap-out", type=Path, default=None,
-                   help="If set, draw a UMAP of the latent representation "
-                        "(neighbors → umap → pl.umap) and save to this PNG path. "
-                        "Follows the umap.ipynb convention: rep is auto-picked "
-                        "from X_harmony > X_scVI > X_pca unless --umap-rep is given.")
+                   help="PNG path for the latent UMAP. Defaults to "
+                        "<out-prefix>_umap.png. "
+                        "UMAP is always drawn at the end (mirrors umap.ipynb); "
+                        "rep is auto-picked from X_harmony > X_scVI > X_pca "
+                        "unless --umap-rep is given.")
     p.add_argument("--umap-rep", type=str, default=None,
                    help="Explicit obsm key for UMAP (e.g. 'X_scVI', 'X_harmony'). "
                         "Overrides auto-detection.")
@@ -413,10 +446,21 @@ def main():
     print("\n=== celltype × batch_pair × metric: raw vs corr (mean_d) ===")
     print(ct_pivot.round(4).to_string(index=False))
 
-    if args.umap_out is not None:
+    # Step 2 (always): latent UMAP at benchmark end, mirroring umap.ipynb.
+    #   neighbors → umap → pl.umap coloured by celltype + batch (+ status).
+    umap_out = (
+        args.umap_out
+        if args.umap_out is not None
+        else out_prefix.with_name(out_prefix.name + "_umap.png")
+    )
+    try:
+        _pick_umap_rep(adata, preferred=args.umap_rep)
+    except KeyError as exc:
+        print(f"[WARN] no latent representation for UMAP, skip drawing: {exc}")
+    else:
         draw_umap(
             adata,
-            out_path=args.umap_out,
+            out_path=umap_out,
             celltype_key=args.celltype_key,
             batch_key=args.batch_key,
             rep=args.umap_rep,

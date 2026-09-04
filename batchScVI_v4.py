@@ -48,6 +48,7 @@ import torch
 from rich import print
 from scipy.sparse import csr_matrix, issparse
 from scvi.module._constants import MODULE_KEYS
+from tqdm.auto import tqdm
 
 
 def sanitize_batch_name(name):
@@ -124,8 +125,15 @@ def decode_with_fixed_latent(model, adata, z, batch_size=512, lib_size=1e4):
             batch_size=batch_size,
             shuffle=False,
         )
+        n_batches = len(loader)
         cell_start = 0
-        for tensors in loader:
+        for tensors in tqdm(
+            loader,
+            total=n_batches,
+            desc="decode_with_fixed_latent",
+            dynamic_ncols=True,
+            leave=False,
+        ):
             inference_input = model.module._get_inference_input(tensors)
             inference_outputs = model.module.inference(**inference_input)
             generative_inputs = model.module._get_generative_input(
@@ -268,6 +276,9 @@ print(f"transform batch={TRANSFORM_BATCH!r}  "
 # %%
 # ===== 1. 数据读取 =====
 adata_all = sc.read_h5ad(INPUT_H5AD)
+# ===== 3. raw counts 写入 X =====
+if "counts" not in adata_all.layers:
+    adata_all.layers["counts"] = adata_all.X.copy()
 
 if CONDITION_KEY is not None:
     if CONDITION_KEY not in adata_all.obs.columns:
@@ -370,7 +381,7 @@ for col in ["status", "company", "celltype.L2", "sex", "sample", "region"]:
         print(vc.head(10))
 
 # %%
-# ===== 3. raw counts 写入 X =====
+
 adata_subset.X = adata_subset.layers["counts"].copy()
 
 # %%
