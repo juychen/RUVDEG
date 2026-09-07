@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================
-# Benchmark scVI / batchscVI / scVInobatch / scviharmony outputs
-# under /data8/junyi/pubdata/transformed/<GSE>_<method>/.
+# Benchmark scVI / batchscVI / batchscvifix / scVInobatch / scviharmony
+# outputs under /data8/junyi/pubdata/transformed/<GSE>_<method>/.
 #
 # Distance-based benchmark: calls benchmarkbyauc_DM.py which computes
 # per-celltype × batch-pair distances (mean_diff, cohens_d, var_ratio,
 # hellinger) on log1p raw vs scVI-corrected layers.
 #
 # Differences from run_benchmark_scvi_*.sh:
-#   * Iterates the 8 method directories
-#   * Auto-detects method (scVI / batchscvi / scVInobatch / scviharmony)
-#     and dataset (GSE133549 / GSE118767) from the directory name
+#   * Iterates the 10 method directories
+#   * Auto-detects method (scVI / batchscvi / batchscvifix / scVInobatch
+#     / scviharmony) and dataset (GSE133549 / GSE118767) from the
+#     directory name
 #   * Picks the method-appropriate normalized/count layer pair
 #   * Prefers *_full.h5ad (with auto-fallback to *.h5ad when the
 #     full file is missing the required normalized layer)
@@ -19,7 +20,6 @@
 #   * Runs prep_pubdata_obs.py first to inject status/company/Model
 #     columns (status/company are not used by DM but harmless; Model is
 #     only consulted when --model is passed)
-#   * Skips _scVI/ dirs (no h5ad, only .model) with a [SKIP] notice
 #
 # Override anything via env vars, e.g.:
 #   INPUT_DIRS="/data8/junyi/pubdata/transformed/GSE118767_scviharmony" \
@@ -31,12 +31,14 @@ set -euo pipefail
 BENCH_SCRIPT="${BENCH_SCRIPT:-/home/junyichen/code/RUVAEDEG/benchmarkbyauc_DM.py}"
 PREP_SCRIPT="${PREP_SCRIPT:-/home/junyichen/code/RUVAEDEG/prep_pubdata_obs.py}"
 
-# 8 method dirs (configurable; default = all 8).
+# 10 method dirs (configurable; default = all 10).
 INPUT_DIRS=(${INPUT_DIRS:-\
     /data8/junyi/pubdata/transformed/GSE118767_scVI \
     /data8/junyi/pubdata/transformed/GSE133549_scVI \
     /data8/junyi/pubdata/transformed/GSE118767_batchscvi \
     /data8/junyi/pubdata/transformed/GSE133549_batchscvi \
+    /data8/junyi/pubdata/transformed/GSE118767_batchscvifix \
+    /data8/junyi/pubdata/transformed/GSE133549_batchscvifix \
     /data8/junyi/pubdata/transformed/GSE118767_scVInobatch \
     /data8/junyi/pubdata/transformed/GSE133549_scVInobatch \
     /data8/junyi/pubdata/transformed/GSE118767_scviharmony \
@@ -77,6 +79,7 @@ mkdir -p "$OUT_ROOT"
 declare -A METHOD_LAYER=(
     [scVI]="scvi_nrom_counts|counts|*_scVI.h5ad|*_scVI_full.h5ad|scVI"
     [batchscvi]="scvi_nrom_counts|counts|*_batchscvi_full.h5ad|*_batchscvi.h5ad|batchscvi"
+    [batchscvifix]="scvi_nrom_counts|counts|*_batchscvifix_full.h5ad|*_batchscvifix.h5ad|batchscvifix"
     [scVInobatch]="scvi_nrom_counts|counts|*_scVInobatch_full.h5ad|*_scVInobatch.h5ad|scVInobatch"
     [scviharmony]="scvi_nrom_counts_harmony|counts|*subset_scviHarmony.h5ad|*_scviHarmony.h5ad|scviharmony"
 )
@@ -88,15 +91,19 @@ declare -A METHOD_LAYER=(
 # public-data harmony / scVI re-runs use different subsets / different
 # ground-truth columns. The most reliable pair (after per-dataset
 # prioritisation) is:
-#   * GSE133549 batchscvi / scVInobatch: nnet2 (cell type) + source_file (batch)
+#   * GSE133549 scVI / batchscvi / batchscvifix / scVInobatch: nnet2 (cell type) + source_file (batch)
 #   * GSE133549 scviharmony:             meta_cell_line_demuxlet + meta_batch
 #   * GSE118767 *:                       meta_cell_line_demuxlet + protocol
 # Override per-call with --celltype-key / --batch-key CLI args.
 declare -A DATASET_METHOD_KEYS=(
+    [GSE133549__scVI]="nnet2|source_file"
     [GSE133549__batchscvi]="nnet2|source_file"
+    [GSE133549__batchscvifix]="nnet2|source_file"
     [GSE133549__scVInobatch]="nnet2|source_file"
     [GSE133549__scviharmony]="nnet2|source_file"
+    [GSE118767__scVI]="meta_cell_line_demuxlet|protocol"
     [GSE118767__batchscvi]="meta_cell_line_demuxlet|protocol"
+    [GSE118767__batchscvifix]="meta_cell_line_demuxlet|protocol"
     [GSE118767__scVInobatch]="meta_cell_line_demuxlet|protocol"
     [GSE118767__scviharmony]="meta_cell_line_demuxlet|protocol"
 )
@@ -117,6 +124,7 @@ extract_method() {
     case "$base" in
         GSE*_scVI|scVI) echo scVI ;;
         GSE*_batchscvi) echo batchscvi ;;
+        GSE*_batchscvifix) echo batchscvifix ;;
         GSE*_scVInobatch) echo scVInobatch ;;
         GSE*_scviharmony) echo scviharmony ;;
         *) return 1 ;;
@@ -300,12 +308,6 @@ for d in "${INPUT_DIRS[@]}"; do
         continue
     fi
     IFS='|' read -r default_ct default_batch <<<"$keys_cfg"
-
-    if [[ "$method" == "scVI" ]]; then
-        # _scVI/ dirs contain only .model, no h5ad output.
-        echo "[SKIP] no h5ad in $d (only .model present)" >&2
-        continue
-    fi
 
     h5ad=$(pick_h5ad "$d" "$primary" "$fallback") || {
         echo "[SKIP] no h5ad matching $primary or $fallback in $d" >&2

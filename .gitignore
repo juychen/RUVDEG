@@ -58,7 +58,17 @@ adata_cache/
 .claude/
 .kilo/
 __pycache__/
+batchScVImodel_output.loss_logs/
+batchScVImodel_output.model/
+benchmark_DM_results_plots/
+figures/
+figures_benchmark_DM_bybrain_bymethod/
+figures_benchmark_DM_summary/
+figures_benchmark_pubdata_summary/
+figures_benchmark_pubdata_summary_bars/
 ppt_figs/
 scvi-tools/
 scviRUV_output.model/
+slide_fig/
+slide_fig2/
 slide_figs/

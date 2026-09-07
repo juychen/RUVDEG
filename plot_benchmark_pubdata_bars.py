@@ -38,6 +38,7 @@ METHODS: list[tuple[str, str]] = [
     ("scVInobatch", "scVI no-batch"),
     ("scviharmony", "scVI-Harmony"),
     ("batchscvi", "scVI-batch"),
+    ("batchscvifix", "scVI-batch-fix"),
 ]
 
 DATASETS: list[tuple[str, str]] = [
@@ -47,10 +48,11 @@ DATASETS: list[tuple[str, str]] = [
 
 # Categorical palette — fixed order, identity (never cycled).
 PALETTE: dict[str, str] = {
-    "scVI": "#7f7f7f",            # gray  (baseline)
-    "scVI no-batch": "#1f77b4",   # blue
-    "scVI-Harmony": "#ff7f0e",    # orange
-    "scVI-batch": "#2ca02c",      # green  (best expected)
+    "scVI": "#7f7f7f",              # gray  (baseline)
+    "scVI no-batch": "#1f77b4",     # blue
+    "scVI-Harmony": "#ff7f0e",      # orange
+    "scVI-batch": "#2ca02c",        # green
+    "scVI-batch-fix": "#9467bd",    # purple
 }
 
 DISTANCE_METRICS: list[tuple[str, str]] = [
